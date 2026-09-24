@@ -59,6 +59,31 @@ for itr in 1..T:
     disp_up = convex_upsample(disp * 2, mask) # 1/2 → 全分辨率
 ```
 
+### 4.1.1 与 WAFT-Stereo 基线的结构对比
+
+基线 `algorithms/waft.py::WAFT` 与本方法 `step2_fusion_composite.py::FusionWarpStereo`
+的逐项差异（均保留「迭代 warp + 凸上采样」主干）：
+
+| 维度 | 原始 WAFT-Stereo | 新 FusionWarp-Stereo |
+|---|---|---|
+| 初始视差 | prop 分支：`prop_proj(cat[f1,f2])` → `prop_decoder(VitIter)` → 视差 **bins 软分类 + soft-argmax** | `GlobalMatcher`：1/8 交叉注意力 + **全范围相关 soft-argmax**（直接初始回归） |
+| 匹配信号 | **无**（仅 `warp(f2,disp)` 后的差分） | **显式**：全局相关 + 窄带相关/轻量代价体（`corr`/`gev` 锚） |
+| 迭代更新输入 | `cat[fmap1, warped_fmap2, net, disp]`（2C+hidden+1） | `cat[f1, warped_f2, net, disp, fused]`（4C+1，多一路 `fused`） |
+| 融合机制 | 无（直接 concat） | `GatedFusion`：可学习门控融合「全局上下文 vs 局部锚」 |
+| 迭代解码器 | `VitIter`（timm 预训练 ViT + LoRA + DPT，**全量 token**） | `TokenSparseViT`（**saliency 门控稀疏**，仅高信息 token 充分更新） |
+| 代价体 | 完全无 | 无全尺寸代价体；注入窄带锚（`SparseCorrAnchor` 或 `GEVCostAnchor`） |
+| 凸上采样 | convex upsample（9 邻域，同） | 同（镜像实现） |
+| 逐轮残差 | `disp = disp.detach()`；`disp += Δdisp`（同） | 同 |
+| 骨干 | DAv2 / DINOv3（输出 `fmap1,fmap2,net` 三元组） | 同（真实版应保留）；POC 用自包含小 `FeatureEncoder`+`MatchFeat` 降级 |
+
+**三个结构性新增**（对应 §3 贡献）：
+1. **初始化替换**：`prop bins 分类` → `GlobalMatcher 全局匹配`（补足大视差/低纹理的粗定位）。
+2. **迭代信号增强**：在 `cat[...]` 里新增 `fused` 一路，把「窄带相关/代价体锚」与「全局上下文」门控后注入（补足局部纹理/遮挡）。
+3. **解码器稀疏化**：`VitIter 全量 token` → `TokenSparseViT 稀疏 token`（降低每轮冗余计算）。
+
+**保持不变**：`disp.detach()` 逐轮停止梯度、`disp_warp` 沿 `-disp` 对齐、`convex_upsample`、
+以及「多轮预测 + 指数加权监督」的整体范式——这正是 WAFT 无代价体高效性的来源。
+
 ### 4.2 GlobalMatcher（GMFlow / STTR / SEA-RAFT）
 
 - 将 `f1,f2` 池化到 1/8，展平成 token 并加可学习位置编码；
