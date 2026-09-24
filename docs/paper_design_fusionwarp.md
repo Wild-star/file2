@@ -221,56 +221,68 @@ POC 实测（CPU）：`step3_ablation.py` 120 步公平对比中，gev 锚相对
 
 ---
 
-## 9. 原创性与 prior work 声明（诚实对照）
+## 9. 原创性与 prior work 声明（诚实对照 · 2026-09 修订）
 
-> 本节是**学术诚信声明**，投稿前必须保留并据此调整贡献主张。
+> 本节是**学术诚信声明**，投稿前必须保留。2026-09 修订：在读到 WAVE-Stereo 完整方法
+> （arXiv:2607.13674 全文 §3）后，将原「核心 novelty 撞车」的结论修正为
+> 「**动机撞车、实现象限正交**」，并给出三个可证伪的差异化主张（§9.3）。
 
-### 9.1 核心事实
+### 9.1 核心事实（修订）
 
-本设计的核心 insight——「相关体（matching search）与 warp 残差（residual alignment）
-是互补的对应表示，应统一注入迭代更新器」——与 **WAVE-Stereo**
-（arXiv:2607.13674，2026-07-15 公开，Zehan Liu et al.）**高度撞车**。
-WAVE-Stereo 的立论动机与本设计几乎一致：它明确把 WAFT-Stereo（本设计的基线）
-定位为「只用 warp、丢弃匹配候选信息」的 paradigm split 之一端，并提出
-GeoWarp Correspondence Encoder（GWCE）统一两种表示。
+本设计的核心动机——「相关（matching search）与 warp 残差（residual alignment）是
+互补的对应表示，应统一注入迭代更新器」——与 **WAVE-Stereo**（arXiv:2607.13674，
+2026-07-15，Zehan Liu et al.）**动机一致**。WAVE-Stereo 明确把 WAFT-Stereo 定位为
+「只用 warp、丢弃匹配候选信息」的 paradigm split 之一端，提出 GWCE（GeoWarp
+Correspondence Encoder）+ PGCP（Periodic Global Context Propagation）统一两种表示。
 
-**结论：本设计的核心 novelty 已被 WAVE-Stereo 抢先发表。** 这不是「引用即可」的
-related work，而是需要重新定位贡献的 **prior work**。
+**但两者落在正交的实现象限**（见 §9.2）：WAVE 走「轻量无 VFM + ConvGRU 局部迭代 +
+周期补全局 + 带聚合的几何编码体积」；本设计走「VFM 先验 + ViT 原生全局迭代 +
+无聚合逐点相关锚」。因此动机撞车，但**不是「已被抢先发表的同一方案」**，而是同一
+动机在两个架构象限的独立实现——差异化空间存在，但必须以**可证伪的实验命题**
+（而非「首次统一相关与 warp」的原创主张）来支撑。
 
-### 9.2 与 WAVE-Stereo 的逐点对照（基于其全文 §3）
+### 9.2 与 WAVE-Stereo 的逐点对照（基于其完整方法 §3，2026-09 修订）
 
-| 维度 | WAVE-Stereo | 本设计 FusionWarp-Stereo | 关系 |
+| 维度 | WAVE-Stereo | FusionWarp-Stereo（本设计） | 关系 |
 |---|---|---|---|
-| 核心 insight | 相关体 + warp 互补，统一注入 ConvGRU | 相关锚 + warp 互补，统一注入迭代更新 | **撞车** |
-| 基线立论 | 反对 WAFT「只用 warp」 | 在 WAFT 上注入相关锚 | 同源动机 |
-| 初始视差 | all-pairs 相关 + 2D 聚合 + soft-argmin | GlobalMatcher 交叉注意力 + 全范围相关 soft-argmax | 相近 |
-| 匹配检索 | IGEV 式几何编码体（2D 聚合） | 窄带相关锚 / GEV（轻量 3D 聚合） | 相近 |
-| warp 分支 | Warp(fR,d) + 卷积编码 | disp_warp(f2,disp) + concat | 相同（都继承 RAFT/WAFT） |
-| 迭代单元 | ConvGRU | TokenSparseViT（WAFT 式 ViT + 稀疏） | 不同 |
-| 全局上下文 | PGCP：周期性 1/32 ViT 注入 GRU 隐态 | GlobalMatcher 的 g_feat + 门控融合 | 方向相近 |
-| 融合 | concat + Fusion 卷积 | GatedFusion 门控 | 相近 |
-| 损失 | SmoothL1 + L1 指数加权 | MixtureLaplace + 辅助监督 | 不同 |
-| 实验 | 5 基准零样本 + 全量训练（8×A100） | CPU POC + 消融（无全量训练） | 远未到发表级 |
+| 骨干 | MobileNetV2 + FPN，**无 VFM** | **DAv2/DINOv3 VFM 先验**（冻结 + LoRA） | 正交 |
+| 分辨率 | 1/4（Cf=24） | 1/2（48ch，VFM 输出） | 不同 |
+| 初始视差 | all-pairs 相关 + **2D 聚合** + soft-argmin | GlobalMatcher 交叉注意力 + 全范围相关 soft-argmax（**无聚合**） | 相近，聚合策略相反 |
+| 匹配证据 | **几何编码体积**（IGEV 式，带 2D/3D 聚合） | **无聚合逐点相关锚**（SparseCorrAnchor） | **对抗** |
+| warp 分支 | Warp(fR,d) + 卷积编码 | disp_warp(f2,disp) + concat | 相同（继承 RAFT/WAFT） |
+| 迭代单元 | **ConvGRU**（局部 RNN，训练 12 / 推理 8 轮） | **ViT**（原生全局注意力，WAFT 式 3 轮） | 正交 |
+| 全局上下文 | **PGCP**：每 K 轮 8× 池化到 1/32 → 3 层 ViT(dim=128)+DPT → 注入 GRU 隐态（α=-0.1） | **无需 PGCP**（ViT 每轮原生全局注意力） | **对抗** |
+| 融合 | concat + Fusion 卷积 | 零初始化加到 delta_proj 输出（手术安全） | 不同 |
+| 损失 | SmoothL1(初始) + L1(迭代 γ=0.9) | mixlap（混合拉普拉斯）+ init KL | 不同 |
+| 精度 / 速度 | 66ms / 980MB / ETH3D 0.86 BP-2 | 601ms / 10GB / ETH3D 0.32 BP-2 | 互补象限 |
 
-### 9.3 剩余差异化贡献（诚实评估）
+**关键纠正**：初版 §9 把「匹配检索」「全局上下文」判为「相近/方向相近」，是未读到
+WAVE 具体实现时的误判。实际二者在这两个维度上是**对抗的**：WAVE 用带聚合的几何
+编码体积，而本设计 step3 实测「无聚合相关 > 3D 聚合」；WAVE 因 ConvGRU 局部而被迫
+引入 PGCP 补全局，而本设计 ViT 原生全局、无需补丁。
 
-本设计相对 WAVE-Stereo 的差异点，均属**实现细节级**，不足以构成独立论文的核心 novelty：
-1. GlobalMatcher 全局匹配初始化（vs 2D 代价聚合初始化）；
-2. GatedFusion 门控融合 + 全局上下文种子 `g_feat`；
-3. TokenSparseViT 稀疏解码（vs ConvGRU + PGCP）；
-4. 可分离 3D 的 GEV 锚（vs 无 3D 的 2D 聚合）。
+### 9.3 三个可证伪的差异化主张（升级自原「实现细节级」评估）
 
-这些可作为「WAVE-Stereo 变体」或「差异化消融」的素材，而非新方法的原创贡献。
+1. **【最硬】无聚合相关 > 几何编码体积聚合**。step3 实测（96×128 POC，120 步，
+   公平初始化）：corr 无聚合 +23.9%，gev-full3d 带聚合 +13.9%，gev-sep3d +20.3%。
+   若全量训练复现，即直接反驳 WAVE 的几何编码体积（IGEV 式聚合）设计。
+2. **【架构命题】ViT 原生全局 vs ConvGRU + 周期 PGCP**。WAVE 被迫用 PGCP 补全局；
+   本设计证明 ViT 迭代器自带全局、无需额外模块。可消融回答「每轮全局注意力 vs
+   周期性全局注入」孰优。
+3. **【象限补位】VFM 先验 + 最小匹配分支**。WAVE 明确无 VFM；本设计在 VFM 特征上
+   用 34K 参数匹配分支把「GT 对齐 argmax 命中率」从 46% 提到 87%（step1）。
+   「如何让 VFM 通用特征廉价变匹配友好」是 WAVE 无法回答、本设计能回答的问题。
 
-### 9.4 论文重新定位（三选一）
+### 9.4 论文重新定位（修订）
 
-1. **【诚实·推荐】变体/差异化消融研究**：放弃「统一相关与 warp」的原创主张，
-   明确以 WAVE-Stereo 为 prior work，聚焦回答「WAFT 式 ViT 迭代 + 全局匹配初始化
-   + token 稀疏 的组合，是否优于/劣于 WAVE-Stereo 的 ConvGRU + PGCP」。
-2. **【降级】复现 + 验证**：作为 WAFT 与 WAVE-Stereo 的复现/工程实现，不做投稿，
-   仅供研究记录。
-3. **【高风险】另寻实质差异**：目前没有足够强的差异化点支撑，不建议。
+1. **【推荐】跨象限系统研究 / 对抗性消融**：不以「首次统一相关与 warp」为原创，
+   明确以 WAVE-Stereo 为 prior work，聚焦三个可证伪命题（§9.3），回答「相关+warp
+   融合从轻量 ConvGRU 象限搬到 VFM+ViT 象限后，匹配证据应以无聚合形式注入、且 ViT
+   原生全局使 PGCP 冗余」。
+2. **【降级】复现 + 验证**：WAFT / WAVE 的复现与工程实现，不做投稿。
+3. **【高风险】另寻实质差异**：不建议，除非全量训练后出现意料之外的强结果。
 
-**决定：本设计后续以「WAVE-Stereo 的差异化消融/变体」定位推进；所有文档与代码
-必须显式引用 WAVE-Stereo 作为 prior work。**
+**决定：本设计以「WAVE-Stereo 的跨象限差异化 / 对抗性消融」定位推进；所有文档与
+代码必须显式引用 WAVE-Stereo 作为 prior work，并保留 §9.3 的三个可证伪命题作为
+投稿时的贡献主张边界。**
 
