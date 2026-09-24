@@ -55,6 +55,30 @@ _CN.WAFT.ITERATIVE_MODULE.DELTA_ITER.LORA_ALPHA = None
 _CN.WAFT.ITERATIVE_MODULE.DELTA_ITER.PATCH_SIZE = None
 
 # ---------------------------------------------------------------------------- #
+# FusionWarp 融合模块（缝合到 WAFT；ENABLED=False 时完全等价原版）
+# ---------------------------------------------------------------------------- #
+_CN.WAFT.FUSION = CN()
+_CN.WAFT.FUSION.ENABLED = False
+# 注入无聚合相关锚（方向1）
+_CN.WAFT.FUSION.USE_ANCHOR = True
+# 用 GlobalMatcher 全范围相关直接回归替换 bins 分类初始视差（方向2）
+_CN.WAFT.FUSION.USE_GLOBAL_INIT = False
+# 锚类型："corr"（无聚合相关，推荐）| "gev"（可分离 3D 聚合，对抗性消融对照）
+_CN.WAFT.FUSION.ANCHOR_KIND = "corr"
+# 匹配分支（方向3）通道数，输出 1/4 分辨率
+_CN.WAFT.FUSION.MATCH_CH = 32
+# SparseCorrAnchor 窄带半径 / 分组数
+_CN.WAFT.FUSION.CORR_RADIUS = 4
+_CN.WAFT.FUSION.CORR_GROUPS = 8
+# GEVCostAnchor 参数（仅 ANCHOR_KIND="gev" 生效）
+_CN.WAFT.FUSION.GEV_AGG_KIND = "sep3d"   # "sep3d" | "full3d"
+_CN.WAFT.FUSION.GEV_K = 9
+_CN.WAFT.FUSION.GEV_R = 8
+# GlobalMatcher 参数（仅 USE_GLOBAL_INIT=True 生效）
+_CN.WAFT.FUSION.GM_HEADS = 4
+_CN.WAFT.FUSION.GM_NDISP = None          # None = MAX_DISP // 8
+
+# ---------------------------------------------------------------------------- #
 # Dataset and data augmentation
 # ---------------------------------------------------------------------------- #
 _CN.DATASETS = CN()

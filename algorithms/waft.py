@@ -10,6 +10,7 @@ from einops import rearrange
 from model.iterative import fetch_iterative_module
 from model.encoder import fetch_feature_encoder
 from model.utils import Padder, disp_warp, gaussian_weights
+from model.fusion import MatchingBranch, SparseCorrAnchor, GEVCostAnchor, GlobalMatcher
 
 def freeze_module(module):
     for p in module.parameters():
@@ -37,6 +38,32 @@ class WAFT(nn.Module):
         self.delta_disp_head = Mlp(self.hidden_dim, self.hidden_dim, 1, use_conv=True)
         self.prop_mask_head = Mlp(self.hidden_dim, self.hidden_dim, 4*9, use_conv=True)
         self.prop_bins_head = Mlp(self.hidden_dim, self.hidden_dim, self.n_bins, use_conv=True)
+
+        # ------------------------------------------------------------------ #
+        # FusionWarp 融合模块（可消融，默认关闭 → 等价原版）
+        # ------------------------------------------------------------------ #
+        fusion_cfg = cfg.WAFT.FUSION if 'FUSION' in cfg.WAFT else None
+        self.fusion_enabled = bool(fusion_cfg is not None and fusion_cfg.ENABLED)
+        self.use_anchor = self.fusion_enabled and bool(fusion_cfg.USE_ANCHOR)
+        self.use_global_init = self.fusion_enabled and bool(fusion_cfg.USE_GLOBAL_INIT)
+        self.anchor_kind = getattr(fusion_cfg, 'ANCHOR_KIND', 'corr') if fusion_cfg is not None else 'corr'
+
+        if self.use_anchor:
+            mch = fusion_cfg.MATCH_CH
+            self.matching_branch = MatchingBranch(ch=mch, out_ch=mch)
+            if self.anchor_kind == 'corr':
+                self.corr_anchor = SparseCorrAnchor(
+                    C=mch, G=fusion_cfg.CORR_GROUPS, R=fusion_cfg.CORR_RADIUS, out_ch=self.hidden_dim)
+            elif self.anchor_kind == 'gev':
+                self.gev_anchor = GEVCostAnchor(
+                    C=mch, G=4, K=fusion_cfg.GEV_K, R=fusion_cfg.GEV_R, Cv=8,
+                    out_ch=self.hidden_dim, agg_kind=fusion_cfg.GEV_AGG_KIND)
+            else:
+                raise ValueError(f"Unknown FUSION.ANCHOR_KIND: {self.anchor_kind}")
+
+        if self.use_global_init:
+            n_disp = fusion_cfg.GM_NDISP if fusion_cfg.GM_NDISP is not None else (self.max_disp // 8)
+            self.global_matcher = GlobalMatcher(C=self.enc_dim, heads=fusion_cfg.GM_HEADS, n_disp=n_disp)
 
     def normalize_image(self, img):
         '''
@@ -67,6 +94,11 @@ class WAFT(nn.Module):
         fmap1, fmap2, net = self.encoder(torch.stack([image1, image2], dim=1))
         n, _, h, w = fmap1.shape
 
+        # ---- 匹配分支（方向3）：从原始图像提匹配友好特征（1/4 分辨率）----
+        if self.use_anchor:
+            m1 = self.matching_branch(image1)
+            m2 = self.matching_branch(image2)
+
         idx_bins_2x = torch.linspace(0, self.max_disp/2, self.n_bins, device=fmap1.device, dtype=fmap1.dtype).view(1, self.n_bins, 1, 1)
         idx_bins_1x = torch.linspace(0, self.max_disp/1, self.n_bins, device=fmap1.device, dtype=fmap1.dtype).view(1, self.n_bins, 1, 1)
 
@@ -77,7 +109,13 @@ class WAFT(nn.Module):
         prob_up = self.convex_upsample(prob_bins, prob_mask)
         output['init'] = padder.unpad(prob_up)
         prob_bins = F.softmax(prob_bins, dim=1)
-        disp = torch.sum(prob_bins * idx_bins_2x, dim=1, keepdim=True)
+        disp_bins = torch.sum(prob_bins * idx_bins_2x, dim=1, keepdim=True)
+
+        # ---- GlobalMatcher（方向2）：全范围相关 + 交叉注意力 直接回归初始视差 ----
+        # 可开关：USE_GLOBAL_INIT=True 时用 d_gm 替换 bins 分类作为迭代起点
+        disp = disp_bins
+        if self.use_global_init:
+            disp = self.global_matcher(fmap1, fmap2)  # (B, 1, H/2, W/2)
 
         if disp_init is not None:
             disp = padder.pad(disp_init.unsqueeze(1))
@@ -89,6 +127,19 @@ class WAFT(nn.Module):
             disp = disp.detach()
             warped_fmap2 = disp_warp(fmap2, disp, padding_mode='zeros')
             net = self.delta_proj(torch.cat([fmap1, warped_fmap2, net, disp], dim=1))
+
+            # ---- 锚注入（方向1）：无聚合相关锚，零初始化 → 等价原版，加到 delta_proj 输出 ----
+            if self.use_anchor:
+                # disp 从 1/2 降到 1/4（与匹配特征同尺度），视差 ×0.5
+                disp_q = F.interpolate(disp, scale_factor=0.5, mode='bilinear', align_corners=True) * 0.5
+                if self.anchor_kind == 'corr':
+                    anchor = self.corr_anchor(m1, m2, disp_q)
+                else:  # gev
+                    _, anchor = self.gev_anchor(m1, m2, disp_q)
+                # 上采样回 1/2，与 delta_proj 输出同尺度
+                anchor = F.interpolate(anchor, size=fmap1.shape[-2:], mode='bilinear', align_corners=True)
+                net = net + anchor
+
             net = self.delta_decoder(net)
             info = self.delta_dist_head(net)
             delta_disp = self.delta_disp_head(net)

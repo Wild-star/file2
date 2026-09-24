@@ -1,0 +1,49 @@
+ALGORITHM: "waft"
+WAFT:
+  MAX_DISP: 800
+  LOSS: ['mixlap_40']
+  FEATURE_ENCODER:
+    TYPE: "dav2"
+    ARCH: "vits"
+    LORA_RANK: 8
+    LORA_ALPHA: 16
+  ITERATIVE_MODULE:
+    TASK: ['delta', 'delta', 'delta']
+    DELTA_ITER:
+      TYPE: "vit"
+      ARCH: "vits"
+      PATCH_SIZE: 8
+    PROP_ITER:
+      TYPE: "vit"
+      ARCH: "vits"
+      PATCH_SIZE: 8
+  FUSION:
+    ENABLED: True
+    USE_ANCHOR: True          # 方向1：注入无聚合相关锚
+    USE_GLOBAL_INIT: False    # 方向2：True 时用 GlobalMatcher 替换 bins 分类初始视差
+    ANCHOR_KIND: "corr"       # "corr"(无聚合) | "gev"(3D 聚合，对抗性消融对照)
+    MATCH_CH: 32              # 方向3：匹配分支通道数
+    CORR_RADIUS: 4
+    CORR_GROUPS: 8
+    GEV_AGG_KIND: "sep3d"
+    GEV_K: 9
+    GEV_R: 8
+    GM_HEADS: 4
+    GM_NDISP: null            # null = MAX_DISP // 8 = 100
+DATASETS:
+  TRAIN: ("sceneflow", "tartanair", "crestereo", "fsd", "sintelstereo", "fallingthings", "vkitti2", "unrealstereo4k", "wmgstereo", "carlahighres", "spring", "tartanground")
+  MUL: (1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)
+  CROP_SIZE: [480, 640]
+  TEST: ("things",)
+TEST:
+  EVAL_PERIOD: 10000
+  EVAL_THRESH: (['1.0', '3.0'],)
+  EVAL_MAX_DISP: [null,]
+  EVAL_ONLY_VALID: (True,)
+SOLVER:
+  MIX_PRECISION: True
+  NO_RESUME_OPTIMIZER: True
+  IMS_PER_BATCH: 32
+  MAX_ITER: 400000
+  CHECKPOINT_PERIOD: 10000
+  BASE_LR: 0.0005
