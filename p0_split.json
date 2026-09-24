@@ -1,0 +1,33 @@
+{
+  "train": [
+    "delivery_area_2s",
+    "forest_2s",
+    "electro_3l",
+    "playground_2l",
+    "delivery_area_3s",
+    "delivery_area_1l",
+    "electro_1s",
+    "terrace_1s",
+    "playground_3l",
+    "playground_2s",
+    "terrains_1l",
+    "terrains_2l",
+    "delivery_area_3l"
+  ],
+  "holdout": [
+    "delivery_area_2l",
+    "terrace_2s",
+    "electro_1l",
+    "electro_3s",
+    "playground_3s",
+    "electro_2s",
+    "terrains_2s",
+    "playground_1l",
+    "playground_1s",
+    "electro_2l",
+    "delivery_area_1s",
+    "forest_1s",
+    "terrains_1s",
+    "facade_1s"
+  ]
+}
