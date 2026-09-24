@@ -1,0 +1,42 @@
+{
+  "steps": 120,
+  "batch": 4,
+  "results": {
+    "easy_fusion": {
+      "name": "easy_fusion",
+      "epe_first": 12.684208869934082,
+      "epe_last": 2.7806003093719482,
+      "time_s": 277.1
+    },
+    "easy_ot": {
+      "name": "easy_ot",
+      "epe_first": 16.108144760131836,
+      "epe_last": 2.074260711669922,
+      "time_s": 94.8
+    },
+    "easy_unc": {
+      "name": "easy_unc",
+      "epe_first": 13.102951049804688,
+      "epe_last": 1.6891899108886719,
+      "time_s": 108.8
+    },
+    "hard_fusion": {
+      "name": "hard_fusion",
+      "epe_first": 20.20374298095703,
+      "epe_last": 3.680511951446533,
+      "time_s": 110.1
+    },
+    "hard_ot": {
+      "name": "hard_ot",
+      "epe_first": 21.91754150390625,
+      "epe_last": 8.864410400390625,
+      "time_s": 102.6
+    },
+    "hard_unc": {
+      "name": "hard_unc",
+      "epe_first": 20.20374298095703,
+      "epe_last": 8.600762367248535,
+      "time_s": 108.6
+    }
+  }
+}

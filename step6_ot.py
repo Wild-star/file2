@@ -42,7 +42,7 @@ D_CAND = 9           # 视差候选数（1/8 尺度，覆盖 0~32 全分辨率�
 
 class OTGlobalMatcher(nn.Module):
     """FlowIt 式 OT 全局匹配：视差相关 + Sinkhorn OT + 峰值置信度。"""
-    def __init__(self, C=32, D=24, heads=4, img_h=96, img_w=128, reg=0.5, iters=20):
+    def __init__(self, C=32, D=9, heads=4, img_h=96, img_w=128, reg=0.5, iters=20):
         super().__init__()
         self.C, self.D, self.reg, self.iters = C, D, reg, iters
         self.h, self.w = img_h // 8, img_w // 8
@@ -96,7 +96,7 @@ class OTGlobalMatcher(nn.Module):
 
 class OTFusionWarp(nn.Module):
     """FusionWarp + OTGlobalMatcher（其余与 FusionWarpStereo 相同）。"""
-    def __init__(self, C=32, hidden=32, G=8, R=4, D=24, iters=2, img_h=96, img_w=128):
+    def __init__(self, C=32, hidden=32, G=8, R=4, D=9, iters=2, img_h=96, img_w=128):
         super().__init__()
         self.encoder = FeatureEncoder(C)
         self.match = MatchFeat(C)
