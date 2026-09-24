@@ -19,8 +19,9 @@ WAFT:
       PATCH_SIZE: 8
   FUSION:
     ENABLED: True
-    USE_ANCHOR: True          # 方向1：注入无聚合相关锚
+    USE_ANCHOR: True          # 方向1：注入相关锚
     USE_GLOBAL_INIT: False    # 方向2：True 时用 GlobalMatcher 替换 bins 分类初始视差
+    USE_GATED_FUSION: False   # 深度融合：True 时 GatedFusion 门控融合「局部锚 + 全局上下文」
     ANCHOR_KIND: "corr"       # "corr"(无聚合) | "gev"(3D 聚合，对抗性消融对照)
     MATCH_CH: 32              # 方向3：匹配分支通道数
     CORR_RADIUS: 4

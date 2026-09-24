@@ -24,7 +24,7 @@ import torch.nn.functional as F
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
-from model.fusion import MatchingBranch, SparseCorrAnchor, GEVCostAnchor, GlobalMatcher
+from model.fusion import MatchingBranch, SparseCorrAnchor, GEVCostAnchor, GlobalMatcher, GatedFusion
 from model.utils import disp_warp
 
 
@@ -70,23 +70,42 @@ def test_gev_cost_anchor():
 
 
 def test_global_matcher():
-    print("[4] GlobalMatcher（全范围相关 + 交叉注意力 → 直接回归）")
+    print("[4] GlobalMatcher（可学习交叉注意力 + 全范围相关 → d_gm + g_feat）")
     C, heads, n_disp = 48, 4, 16
     gm = GlobalMatcher(C=C, heads=heads, n_disp=n_disp)
     f1 = torch.randn(2, C, 32, 40)   # 1/2 尺度
     f2 = torch.randn(2, C, 32, 40)
-    d_gm = gm(f1, f2)
+    d_gm, g_feat = gm(f1, f2)
     assert d_gm.shape == (2, 1, 32, 40), f"d_gm 形状 {d_gm.shape}"
+    assert g_feat.shape == (2, C, 32, 40), f"g_feat 形状 {g_feat.shape}"
     assert (d_gm >= 0).all() and (d_gm <= (n_disp - 1) * 4).all(), \
         f"d_gm 值域应落在 [0, {(n_disp - 1) * 4}]，实际 [{d_gm.min().item():.2f}, {d_gm.max().item():.2f}]"
-    # 反向：梯度能流到 cross attention
-    d_gm.mean().backward()
+    # 反向：梯度能流到交叉注意力（含 QKV 投影）
+    (d_gm.mean() + g_feat.mean()).backward()
+    assert gm.cross.to_q.weight.grad is not None, "GlobalMatcher QKV 无梯度"
     assert gm.cross.ff[0].weight.grad is not None, "GlobalMatcher 无梯度"
-    print(f"    ✅ d_gm 形状 {tuple(d_gm.shape)}，值域 [{d_gm.min().item():.2f}, {d_gm.max().item():.2f}]，梯度正常")
+    print(f"    ✅ d_gm {tuple(d_gm.shape)} 值域 [{d_gm.min().item():.2f}, {d_gm.max().item():.2f}]，"
+          f"g_feat {tuple(g_feat.shape)}，QKV 梯度正常")
+
+
+def test_gated_fusion():
+    print("[5] GatedFusion（门控融合局部锚 + 全局上下文，零初始化）")
+    C = 48
+    gf = GatedFusion(C=C)
+    # 零初始化自检：out_scale=0 → fused 恒 0
+    assert gf.out_scale.item() == 0.0, "GatedFusion out_scale 应零初始化"
+    anchor = torch.randn(2, C, 16, 24)
+    g_feat = torch.randn(2, C, 16, 24)
+    fused = gf(anchor, g_feat)
+    assert fused.shape == (2, C, 16, 24), f"fused 形状 {fused.shape}"
+    assert fused.abs().max().item() < 1e-6, f"零初始化 fused 应恒 0，实际 {fused.abs().max().item()}"
+    fused.mean().backward()
+    assert gf.gate.weight.grad is not None, "GatedFusion 无梯度"
+    print(f"    ✅ fused 形状 {tuple(fused.shape)}，零初始化 max|fused|={fused.abs().max().item():.2e}（恒 0），梯度正常")
 
 
 def test_waft_full():
-    print("[5] 完整 WAFT 前向 + 反向（DAv2 vits，小输入）")
+    print("[6] 完整 WAFT 前向 + 反向（DAv2 vits，小输入）")
     from bridgedepth.config import get_cfg
     from algorithms.waft import WAFT
 
@@ -131,12 +150,31 @@ def test_waft_full():
     assert out2['disp_pred'].shape == (1, 128, 160)
     print("    ✅ USE_GLOBAL_INIT=True 前向通过（GlobalMatcher 替换初始视差）")
 
+    # 打开 GatedFusion（门控融合局部锚 + 全局上下文）
+    cfg3 = get_cfg()
+    cfg3.merge_from_file("configs/SynLarge/DAv2S-4.yaml")
+    cfg3.WAFT.MAX_DISP = 128
+    cfg3.WAFT.FUSION.ENABLED = True
+    cfg3.WAFT.FUSION.USE_ANCHOR = True
+    cfg3.WAFT.FUSION.USE_GLOBAL_INIT = True
+    cfg3.WAFT.FUSION.USE_GATED_FUSION = True
+    cfg3.WAFT.FUSION.ANCHOR_KIND = "corr"
+    cfg3.freeze()
+    model3 = WAFT(cfg3)
+    out3 = model3(sample)
+    assert out3['disp_pred'].shape == (1, 128, 160)
+    loss3 = out3['disp_pred'].abs().mean()
+    loss3.backward()
+    assert model3.gated_fusion.gate.weight.grad is not None, "GatedFusion 无梯度"
+    print("    ✅ USE_GATED_FUSION=True 前向+反向通过（GatedFusion 门控融合生效）")
+
 
 if __name__ == '__main__':
     test_matching_branch()
     test_sparse_corr_anchor()
     test_gev_cost_anchor()
     test_global_matcher()
+    test_gated_fusion()
     print("\n[模块级自检全部通过]")
     if '--full' in sys.argv:
         test_waft_full()

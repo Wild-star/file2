@@ -26,12 +26,15 @@ from bridgedepth.loss import build_criterion
 STEPS = int(os.environ.get('STEPS', '5'))
 ANCHOR = os.environ.get('ANCHOR', 'corr')          # corr | gev
 GLOBAL_INIT = os.environ.get('GLOBAL_INIT', '0') == '1'
+GATED_FUSION = os.environ.get('GATED_FUSION', '0') == '1'
+TOKEN_SPARSE = os.environ.get('TOKEN_SPARSE', '0') == '1'
 H, W = 128, 160
 MAX_DISP = 128
 BATCH = 1
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-print(f"[设备] {device}  |  STEPS={STEPS}  ANCHOR={ANCHOR}  GLOBAL_INIT={GLOBAL_INIT}  input={H}x{W}")
+print(f"[设备] {device}  |  STEPS={STEPS}  ANCHOR={ANCHOR}  GLOBAL_INIT={GLOBAL_INIT}  "
+      f"GATED_FUSION={GATED_FUSION}  TOKEN_SPARSE={TOKEN_SPARSE}  input={H}x{W}")
 
 # ---- 构建 fusion 配置 ----
 cfg = get_cfg()
@@ -41,6 +44,9 @@ cfg.WAFT.FUSION.ENABLED = True
 cfg.WAFT.FUSION.USE_ANCHOR = True
 cfg.WAFT.FUSION.ANCHOR_KIND = ANCHOR
 cfg.WAFT.FUSION.USE_GLOBAL_INIT = GLOBAL_INIT
+cfg.WAFT.FUSION.USE_GATED_FUSION = GATED_FUSION
+if TOKEN_SPARSE:
+    cfg.WAFT.ITERATIVE_MODULE.DELTA_ITER.TYPE = 'vit_sparse'
 cfg.freeze()
 
 model = WAFT(cfg).to(device)

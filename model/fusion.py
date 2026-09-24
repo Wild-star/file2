@@ -167,6 +167,7 @@ def _mha(q, k, v, heads):
 class CrossAttentionLayer(nn.Module):
     """左↔右 token 交叉注意力（增强特征，缓解低纹理/遮挡歧义）。
 
+    带可学习 Q/K/V 投影（左右共享权重），让注意力真正可学习「该关注什么」。
     注意：不显式加位置编码——输入 fmap 来自 DAv2/DINOv3 的 ViT 编码器，
     其 token 已隐含位置信息（这与从零训练的小编码器不同）。
     """
@@ -176,12 +177,18 @@ class CrossAttentionLayer(nn.Module):
         self.norm1 = nn.LayerNorm(C)
         self.norm2 = nn.LayerNorm(C)
         self.heads = heads
+        # 可学习 Q/K/V 投影（左右共享）
+        self.to_q = nn.Linear(C, C)
+        self.to_k = nn.Linear(C, C)
+        self.to_v = nn.Linear(C, C)
         self.ff = nn.Sequential(nn.Linear(C, 2 * C), nn.GELU(), nn.Linear(2 * C, C))
 
     def forward(self, left, right):
-        l2 = _mha(self.norm1(left), self.norm1(right), self.norm1(right), self.heads) + left
+        l = self.norm1(left)
+        r = self.norm1(right)
+        l2 = _mha(self.to_q(l), self.to_k(r), self.to_v(r), self.heads) + left
         l2 = self.ff(self.norm2(l2)) + l2
-        r2 = _mha(self.norm1(right), self.norm1(left), self.norm1(left), self.heads) + right
+        r2 = _mha(self.to_q(r), self.to_k(l), self.to_v(l), self.heads) + right
         r2 = self.ff(self.norm2(r2)) + r2
         return l2, r2
 
@@ -189,8 +196,8 @@ class CrossAttentionLayer(nn.Module):
 class GlobalMatcher(nn.Module):
     """1/8 粗尺度：交叉注意力 + 全范围相关 soft-argmax，直接回归初始视差 d_gm。
 
-    替换 WAFT prop 分支的「bins 软分类 + soft-argmax」起点（可开关 USE_GLOBAL_INIT）。
-    d_gm 上采样回 1/2 尺度（视差 ×4），作为迭代的初始视差。
+    同时输出全局上下文特征 g_feat（1/2 尺度），供 GatedFusion 门控融合使用。
+    d_gm 上采样回 1/2 尺度（视差 ×4），作为迭代的初始视差（可开关 USE_GLOBAL_INIT）。
     """
 
     def __init__(self, C, heads=4, n_disp=100):
@@ -200,6 +207,7 @@ class GlobalMatcher(nn.Module):
         self.heads = heads
         self.n_disp = n_disp
         self.cross = CrossAttentionLayer(C, heads)
+        self.gfeat_proj = nn.Conv2d(2 * C, C, 1)   # 全局上下文特征投影（cat[l,r] → C）
         self.disp_idx = torch.arange(n_disp).view(1, n_disp, 1, 1).float()
 
     def forward(self, f1, f2):
@@ -214,17 +222,39 @@ class GlobalMatcher(nn.Module):
         l, r = self.cross(l, r)
         l = l.transpose(1, 2).reshape(B, self.C, h, w)
         r = r.transpose(1, 2).reshape(B, self.C, h, w)
+        # 全局上下文特征 g_feat（1/8 → 1/2 尺度）
+        g_feat = F.interpolate(torch.cat([l, r], dim=1), scale_factor=4,
+                               mode='bilinear', align_corners=True)  # (B, 2C, H/2, W/2)
+        g_feat = self.gfeat_proj(g_feat)                              # (B, C, H/2, W/2)
         # 全范围相关 + soft-argmax（1/8 尺度）
-        l = F.normalize(l, dim=1)
+        ln = F.normalize(l, dim=1)
         cost = []
         for d in range(self.n_disp):
             w_r = disp_warp(
                 r, torch.full((B, 1, h, w), float(d), device=f1.device, dtype=f1.dtype),
                 padding_mode='zeros')
-            cost.append((l * F.normalize(w_r, dim=1)).sum(1, keepdim=True))
+            cost.append((ln * F.normalize(w_r, dim=1)).sum(1, keepdim=True))
         cost = torch.cat(cost, dim=1)                       # (B, n_disp, h, w)
         prob = F.softmax(cost, dim=1)
         d_gm = torch.sum(prob * self.disp_idx.to(f1.device), dim=1, keepdim=True)  # (B,1,h,w) @1/8
         # 上采样回 1/2 尺度：空间 ×4，视差 ×4
         d_gm = F.interpolate(d_gm, scale_factor=4, mode='bilinear', align_corners=True) * 4.0
-        return d_gm  # (B, 1, H/2, W/2)
+        return d_gm, g_feat  # (B,1,H/2,W/2), (B,C,H/2,W/2)
+
+
+class GatedFusion(nn.Module):
+    """可学习门控融合：空间自适应地融合「局部相关锚」与「全局上下文」。
+
+    gate = σ(conv([anchor, g_feat]))，fused = gate·anchor + (1-gate)·g_feat。
+    输出乘零初始化的 out_scale → 初始 fused=0（手术安全，等价原版），训练时学起来。
+    """
+
+    def __init__(self, C):
+        super().__init__()
+        self.gate = nn.Conv2d(2 * C, 1, 3, padding=1)
+        self.out_scale = nn.Parameter(torch.zeros(1))   # 零初始化 → fused=0
+
+    def forward(self, anchor, g_feat):
+        g = torch.sigmoid(self.gate(torch.cat([anchor, g_feat], dim=1)))
+        fused = g * anchor + (1 - g) * g_feat
+        return fused * self.out_scale

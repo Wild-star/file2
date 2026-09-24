@@ -63,6 +63,8 @@ _CN.WAFT.FUSION.ENABLED = False
 _CN.WAFT.FUSION.USE_ANCHOR = True
 # 用 GlobalMatcher 全范围相关直接回归替换 bins 分类初始视差（方向2）
 _CN.WAFT.FUSION.USE_GLOBAL_INIT = False
+# 用 GatedFusion 门控融合「局部相关锚」与「全局上下文 g_feat」（深度融合，隐含 USE_ANCHOR）
+_CN.WAFT.FUSION.USE_GATED_FUSION = False
 # 锚类型："corr"（无聚合相关，推荐）| "gev"（可分离 3D 聚合，对抗性消融对照）
 _CN.WAFT.FUSION.ANCHOR_KIND = "corr"
 # 匹配分支（方向3）通道数，输出 1/4 分辨率

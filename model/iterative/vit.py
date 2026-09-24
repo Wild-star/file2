@@ -75,6 +75,43 @@ class VitIter(nn.Module):
         final = self.final_mlp(torch.cat([vit_feats[0], res_x, inp], dim=1))
         return final
 
+class TokenSparseVitIter(VitIter):
+    """VitIter + 可学习 token 级 saliency 门控（稀疏更新）。
+
+    每层 ViT block 后：h' = tok + gate ⊙ (blk_out - tok)，gate = 2·σ(saliency(tok))。
+    saliency 零初始化 → σ(0)=0.5 → gate=1 → 与 VitIter 比特级等价（手术安全）。
+    训练时 gate 可学到 <1（稀疏，保留原 token）或 >1（放大更新），实现 token 级
+    选择性更新——这是 ConvGRU（WAVE）不具备的 ViT 独有能力。
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.saliency = nn.Linear(self.dim, 1)
+        nn.init.zeros_(self.saliency.weight)
+        nn.init.zeros_(self.saliency.bias)   # 零初始化 → gate=1 → 等价原版
+
+    def forward(self, inp):
+        x = self.init(inp)
+
+        vit_x = self.patch_embed(x)
+        h, w = vit_x.shape[-2:]
+        vit_x = rearrange(vit_x, 'b c h w -> b (h w) c')
+        vit_feats = []
+        for i in range(len(self.blks)):
+            blk_out = self.blks[i](vit_x)
+            gate = 2.0 * torch.sigmoid(self.saliency(vit_x))   # (B, N, 1)，初始=1
+            vit_x = vit_x + gate * (blk_out - vit_x)           # token 级稀疏更新
+            if i in self.idx:
+                vit_feats.append(rearrange(vit_x, 'b (h w) c -> b c h w', h=h, w=w))
+
+        vit_feats = self.proj(vit_feats)
+        vit_feats = self.upsample(vit_feats)
+
+        res_x = self.res_convs(x)
+
+        final = self.final_mlp(torch.cat([vit_feats[0], res_x, inp], dim=1))
+        return final
+
 if __name__ == '__main__':
     model = VitIter('vitt', 95, patch_size=8, alpha=16, r=8)
     print(model.blks)

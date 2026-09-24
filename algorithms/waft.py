@@ -10,7 +10,7 @@ from einops import rearrange
 from model.iterative import fetch_iterative_module
 from model.encoder import fetch_feature_encoder
 from model.utils import Padder, disp_warp, gaussian_weights
-from model.fusion import MatchingBranch, SparseCorrAnchor, GEVCostAnchor, GlobalMatcher
+from model.fusion import MatchingBranch, SparseCorrAnchor, GEVCostAnchor, GlobalMatcher, GatedFusion
 
 def freeze_module(module):
     for p in module.parameters():
@@ -44,8 +44,10 @@ class WAFT(nn.Module):
         # ------------------------------------------------------------------ #
         fusion_cfg = cfg.WAFT.FUSION if 'FUSION' in cfg.WAFT else None
         self.fusion_enabled = bool(fusion_cfg is not None and fusion_cfg.ENABLED)
-        self.use_anchor = self.fusion_enabled and bool(fusion_cfg.USE_ANCHOR)
         self.use_global_init = self.fusion_enabled and bool(fusion_cfg.USE_GLOBAL_INIT)
+        self.use_gated_fusion = self.fusion_enabled and bool(getattr(fusion_cfg, 'USE_GATED_FUSION', False))
+        # GatedFusion 需要「局部相关锚」作为输入之一，故 use_gated_fusion 隐含 use_anchor
+        self.use_anchor = self.fusion_enabled and (bool(fusion_cfg.USE_ANCHOR) or self.use_gated_fusion)
         self.anchor_kind = getattr(fusion_cfg, 'ANCHOR_KIND', 'corr') if fusion_cfg is not None else 'corr'
 
         if self.use_anchor:
@@ -61,9 +63,14 @@ class WAFT(nn.Module):
             else:
                 raise ValueError(f"Unknown FUSION.ANCHOR_KIND: {self.anchor_kind}")
 
-        if self.use_global_init:
+        # GlobalMatcher 同时服务两个用途：d_gm 作为初始视差起点（USE_GLOBAL_INIT），
+        # g_feat 作为全局上下文供 GatedFusion 门控融合（USE_GATED_FUSION）
+        if self.use_global_init or self.use_gated_fusion:
             n_disp = fusion_cfg.GM_NDISP if fusion_cfg.GM_NDISP is not None else (self.max_disp // 8)
             self.global_matcher = GlobalMatcher(C=self.enc_dim, heads=fusion_cfg.GM_HEADS, n_disp=n_disp)
+
+        if self.use_gated_fusion:
+            self.gated_fusion = GatedFusion(C=self.hidden_dim)
 
     def normalize_image(self, img):
         '''
@@ -111,11 +118,15 @@ class WAFT(nn.Module):
         prob_bins = F.softmax(prob_bins, dim=1)
         disp_bins = torch.sum(prob_bins * idx_bins_2x, dim=1, keepdim=True)
 
-        # ---- GlobalMatcher（方向2）：全范围相关 + 交叉注意力 直接回归初始视差 ----
-        # 可开关：USE_GLOBAL_INIT=True 时用 d_gm 替换 bins 分类作为迭代起点
+        # ---- GlobalMatcher（方向2 + 融合上下文）：全范围相关 + 交叉注意力 ----
+        # d_gm 直接回归初始视差（USE_GLOBAL_INIT=True 时替换 bins 分类起点）
+        # g_feat 全局上下文特征（USE_GATED_FUSION=True 时供 GatedFusion 门控融合）
         disp = disp_bins
-        if self.use_global_init:
-            disp = self.global_matcher(fmap1, fmap2)  # (B, 1, H/2, W/2)
+        g_feat = None
+        if self.use_global_init or self.use_gated_fusion:
+            d_gm, g_feat = self.global_matcher(fmap1, fmap2)  # (B,1,H/2,W/2), (B,C,H/2,W/2)
+            if self.use_global_init:
+                disp = d_gm
 
         if disp_init is not None:
             disp = padder.pad(disp_init.unsqueeze(1))
@@ -128,7 +139,7 @@ class WAFT(nn.Module):
             warped_fmap2 = disp_warp(fmap2, disp, padding_mode='zeros')
             net = self.delta_proj(torch.cat([fmap1, warped_fmap2, net, disp], dim=1))
 
-            # ---- 锚注入（方向1）：无聚合相关锚，零初始化 → 等价原版，加到 delta_proj 输出 ----
+            # ---- 锚 + 门控融合（方向1 + 深度融合）：局部相关锚，可选 GatedFusion 融合全局上下文 ----
             if self.use_anchor:
                 # disp 从 1/2 降到 1/4（与匹配特征同尺度），视差 ×0.5
                 disp_q = F.interpolate(disp, scale_factor=0.5, mode='bilinear', align_corners=True) * 0.5
@@ -138,7 +149,12 @@ class WAFT(nn.Module):
                     _, anchor = self.gev_anchor(m1, m2, disp_q)
                 # 上采样回 1/2，与 delta_proj 输出同尺度
                 anchor = F.interpolate(anchor, size=fmap1.shape[-2:], mode='bilinear', align_corners=True)
-                net = net + anchor
+                if self.use_gated_fusion:
+                    # 门控融合：空间自适应地融合「局部相关锚」与「全局上下文 g_feat」
+                    fused = self.gated_fusion(anchor, g_feat)
+                    net = net + fused
+                else:
+                    net = net + anchor
 
             net = self.delta_decoder(net)
             info = self.delta_dist_head(net)
