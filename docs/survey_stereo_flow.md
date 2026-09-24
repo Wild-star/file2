@@ -101,16 +101,20 @@
 
 ---
 
-## 4. 2026 最新进展与本设计的印证（截至 2026-09）
+## 4. 2026 最新进展与本设计的对照（含 prior-work 撞车声明）
 
-上文各模块的直接引用多为 2018–2024 年经典。经 arXiv 最新检索，2026 年多个工作**直接印证或强化**本设计的核心方向（尤其「相关体与 warp 互补」这一融合主线）：
+> ⚠️ **诚实更正（2026-09）**：本设计核心 insight（相关体与 warp 互补融合）与
+> **WAVE-Stereo**（arXiv:2607.13674，2026-07 公开）**高度撞车**。WAVE-Stereo 是本设计的
+> **prior work**（公开时间早于本设计成文），而非「印证本设计」。本设计的核心 novelty
+> 已被 WAVE-Stereo 抢先，须将其列为 prior work 引用并重新定位剩余差异化贡献。
+> 逐点对照与定位见 `paper_design_fusionwarp.md` §9。
 
-| 本设计模块 | 2026 最新工作 | 印证/强化点 |
+| 本设计模块 | 2026 工作 | 关系 |
 |---|---|---|
-| **核心融合（相关 + warp 互补）** | **WAVE-Stereo**（arXiv:2607.13674，2026-07） | 明确指出「correlation volumes 与 feature warping 是互补匹配线索」，GeoWarp Correspondence Encoder 在 ConvGRU 输入处并行编码匹配搜索 + 残差对齐 + 视差先验 —— 与本设计「SparseCorrAnchor + warp 残差」完全同构 |
-| `SparseCorrAnchor`（窄带相关锚） | **URS-Stereo**（arXiv:2607.06779，2026-07） | 不确定性引导残差搜索：预测传播视差的可靠性 + 残差搜索偏移，**自适应重定位局部代价体中心**（把固定 ±R 窄带升级为 uncertainty-aware） |
-| `GEVCostAnchor`（轻量代价体） | **LiteMatch**（arXiv:2606.31636，2026-06） | 轻量零样本：**无 3D 卷积的代价体稳定化** + CVC-Loss（代价体一致性损失）—— 印证「轻量引用代价体」方向，且给出比「轻量 3D」更进一步的「无 3D」方案 |
-| `GlobalMatcher`（全局注意力初始化） | **LinStereo**（arXiv:2606.25437，2026-06） | Position-Aware Linear Attention 以**线性复杂度**做全局聚合 + Depth Prior Initialization（深度先验热启动）—— 对应本设计 GlobalMatcher 的全局匹配与「直接初始回归」 |
-| `TokenSparseViT`（token 稀疏） | **WHTMix**（arXiv:2607.25234，2026-07） | 用数据无关的 **Walsh-Hadamard 变换域全局 token 混合**（log-linear 成本）替代全局自注意力、保留左右 cross-attention —— 与本设计「降低每轮 token 全量计算」同目标，是更激进的替代方案 |
+| **核心融合（相关 + warp 互补）** | **WAVE-Stereo**（2607.13674，2026-07） | **prior work，核心思想撞车**（GeoWarp Correspondence Encoder 统一 matching search + residual alignment） |
+| `SparseCorrAnchor`（窄带相关锚） | URS-Stereo（2607.06779，2026-07） | 并行方向：不确定性引导残差搜索，自适应重定位窄带中心 |
+| `GEVCostAnchor`（轻量代价体） | LiteMatch（2606.31636，2026-06） | 并行方向：无 3D 卷积的代价体稳定化 + CVC-Loss |
+| `GlobalMatcher`（全局注意力初始化） | LinStereo（2606.25437，2026-06） | 并行方向：线性复杂度全局注意力 + 深度先验热启动 |
+| `TokenSparseViT`（token 稀疏） | WHTMix（2607.25234，2026-07） | 并行方向：Walsh-Hadamard 谱域全局 token 混合 |
 
-**结论**：本设计的模块组合并非「拼凑旧方法」，而是落在一个 2026 年仍在活跃推进的主线上——「把显式匹配（相关/代价体）与 warp 残差迭代互补地融合、并控制全局注意力的成本」。若要强化论文的时效性，上述 5 篇 2026 工作可直接作为本设计的最新文献支撑与改进方向（尤其 WAVE-Stereo 与 URS-Stereo 可作为 related work 的「并行/后续印证」）。
+**结论**：本设计落入一个 2026 年仍在活跃推进的主线——「把显式匹配与 warp 残差迭代互补地融合、并控制全局注意力成本」。但该主线的核心 novelty 已被 WAVE-Stereo 抢先发表，本设计只能以「WAVE-Stereo 的变体 / 差异化消融」定位，不能主张「统一相关与 warp」这一原创贡献。

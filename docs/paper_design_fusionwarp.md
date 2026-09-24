@@ -219,3 +219,58 @@ WAFT 丢弃代价体后丢掉的正是这两点：warping 只提供「当前视�
 POC 实测（CPU）：`step3_ablation.py` 120 步公平对比中，gev 锚相对纯 warp 基线带来
 +13.9%（full3d）/ +20.3%（sep3d）的 EPE 降幅，且 sep3d 精度更高、参数更少、更快（见 §5.1）。
 
+---
+
+## 9. 原创性与 prior work 声明（诚实对照）
+
+> 本节是**学术诚信声明**，投稿前必须保留并据此调整贡献主张。
+
+### 9.1 核心事实
+
+本设计的核心 insight——「相关体（matching search）与 warp 残差（residual alignment）
+是互补的对应表示，应统一注入迭代更新器」——与 **WAVE-Stereo**
+（arXiv:2607.13674，2026-07-15 公开，Zehan Liu et al.）**高度撞车**。
+WAVE-Stereo 的立论动机与本设计几乎一致：它明确把 WAFT-Stereo（本设计的基线）
+定位为「只用 warp、丢弃匹配候选信息」的 paradigm split 之一端，并提出
+GeoWarp Correspondence Encoder（GWCE）统一两种表示。
+
+**结论：本设计的核心 novelty 已被 WAVE-Stereo 抢先发表。** 这不是「引用即可」的
+related work，而是需要重新定位贡献的 **prior work**。
+
+### 9.2 与 WAVE-Stereo 的逐点对照（基于其全文 §3）
+
+| 维度 | WAVE-Stereo | 本设计 FusionWarp-Stereo | 关系 |
+|---|---|---|---|
+| 核心 insight | 相关体 + warp 互补，统一注入 ConvGRU | 相关锚 + warp 互补，统一注入迭代更新 | **撞车** |
+| 基线立论 | 反对 WAFT「只用 warp」 | 在 WAFT 上注入相关锚 | 同源动机 |
+| 初始视差 | all-pairs 相关 + 2D 聚合 + soft-argmin | GlobalMatcher 交叉注意力 + 全范围相关 soft-argmax | 相近 |
+| 匹配检索 | IGEV 式几何编码体（2D 聚合） | 窄带相关锚 / GEV（轻量 3D 聚合） | 相近 |
+| warp 分支 | Warp(fR,d) + 卷积编码 | disp_warp(f2,disp) + concat | 相同（都继承 RAFT/WAFT） |
+| 迭代单元 | ConvGRU | TokenSparseViT（WAFT 式 ViT + 稀疏） | 不同 |
+| 全局上下文 | PGCP：周期性 1/32 ViT 注入 GRU 隐态 | GlobalMatcher 的 g_feat + 门控融合 | 方向相近 |
+| 融合 | concat + Fusion 卷积 | GatedFusion 门控 | 相近 |
+| 损失 | SmoothL1 + L1 指数加权 | MixtureLaplace + 辅助监督 | 不同 |
+| 实验 | 5 基准零样本 + 全量训练（8×A100） | CPU POC + 消融（无全量训练） | 远未到发表级 |
+
+### 9.3 剩余差异化贡献（诚实评估）
+
+本设计相对 WAVE-Stereo 的差异点，均属**实现细节级**，不足以构成独立论文的核心 novelty：
+1. GlobalMatcher 全局匹配初始化（vs 2D 代价聚合初始化）；
+2. GatedFusion 门控融合 + 全局上下文种子 `g_feat`；
+3. TokenSparseViT 稀疏解码（vs ConvGRU + PGCP）；
+4. 可分离 3D 的 GEV 锚（vs 无 3D 的 2D 聚合）。
+
+这些可作为「WAVE-Stereo 变体」或「差异化消融」的素材，而非新方法的原创贡献。
+
+### 9.4 论文重新定位（三选一）
+
+1. **【诚实·推荐】变体/差异化消融研究**：放弃「统一相关与 warp」的原创主张，
+   明确以 WAVE-Stereo 为 prior work，聚焦回答「WAFT 式 ViT 迭代 + 全局匹配初始化
+   + token 稀疏 的组合，是否优于/劣于 WAVE-Stereo 的 ConvGRU + PGCP」。
+2. **【降级】复现 + 验证**：作为 WAFT 与 WAVE-Stereo 的复现/工程实现，不做投稿，
+   仅供研究记录。
+3. **【高风险】另寻实质差异**：目前没有足够强的差异化点支撑，不建议。
+
+**决定：本设计后续以「WAVE-Stereo 的差异化消融/变体」定位推进；所有文档与代码
+必须显式引用 WAVE-Stereo 作为 prior work。**
+
