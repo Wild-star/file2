@@ -1,0 +1,251 @@
+% ============================================================
+% FusionWarp-Stereo — ICASSP 2027 投稿版（盲审匿名）
+% 文档类：IEEEtran conference（ICASSP 官方）
+% 编译：pdflatex
+% 说明：
+%   - 作者信息用匿名占位，Camera-ready 阶段再填
+%   - 第 5 页仅含参考文献 + Acknowledgment + Compliance with Ethical Standards
+% ============================================================
+\documentclass[conference]{IEEEtran}
+
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{cite}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{balance}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+% ===================== 标题 =====================
+\title{FusionWarp-Stereo: Correlation Anchors and Gated Fusion for ViT-Based Iterative Stereo Matching}
+
+% ===================== 作者（盲审匿名占位）=====================
+\author{Anonymous Authors}
+% \author{\IEEEauthorblockN{First Author\IEEEauthorrefmark{1}, Second Author\IEEEauthorrefmark{2}}
+% \IEEEauthorblockA{\IEEEauthorrefmark{1}Department, University, City, Country\\
+% Email: author1@example.com}
+% \IEEEauthorblockA{\IEEEauthorrefmark{2}Department, University, City, Country\\
+% Email: author2@example.com}}
+
+\maketitle
+
+% ===================== 摘要 =====================
+\begin{abstract}
+Iterative stereo matching has split into two paradigms of correspondence representation: explicit matching search via correlation volumes, and local residual refinement via warped features. WAFT-Stereo recently showed that a \emph{pure warping} paradigm---without any cost volume---achieves state-of-the-art accuracy using a frozen monocular visual foundation model (VFM) and a ViT-based iterative decoder, yet it discards explicit matching evidence entirely, forcing the decoder to implicitly re-derive correspondence. WAVE-Stereo unified correlation and warping, but in a lightweight, ConvGRU-based, VFM-free regime. This paper studies the orthogonal quadrant that WAVE-Stereo leaves open: how to inject explicit matching evidence into a VFM + ViT warping pipeline. We propose FusionWarp-Stereo, which augments WAFT with three learnable modules---a lightweight MatchingBranch, a GlobalMatcher with QKV cross-attention and full-range correlation, and a SparseCorrAnchor injecting non-aggregated correlation---fused by a learnable GatedFusion and decoded by a token-sparse ViT. All modules are zero-initialized so that a pretrained WAFT checkpoint yields bit-identical behavior. Preliminary synthetic ablations suggest that non-aggregated correlation anchors outperform aggregated 3D volumes, at only $+2.0\%$ FLOPs and $+0.2\%$ memory. Full-scale training is ongoing.
+\end{abstract}
+
+\begin{IEEEkeywords}
+stereo matching, iterative refinement, foundation model, correlation, ViT
+\end{IEEEkeywords}
+
+% ===================== 1. Introduction =====================
+\section{Introduction}
+Stereo matching estimates dense disparity from a rectified pair and underpins autonomous driving, robotics, and AR. The field has long been dominated by cost-volume methods~\cite{psmnet,gwcnet,acvnet,igev}, which build explicit 4D/3D correlation tensors regularized by 3D convolutions---accurate but computationally and memory expensive. RAFT-Stereo~\cite{raftstereo} introduced an iterative ConvGRU over a correlation pyramid; IGEV-Stereo~\cite{igev} added a geometry-encoding volume. These keep \emph{explicit matching evidence} in the form of correlation features.
+
+A recent line questions whether cost volumes are necessary at all. \textbf{WAFT-Stereo}~\cite{waft} showed that a \emph{pure warping} algorithm---warping the right feature with the current disparity and iteratively correcting residuals with a ViT decoder on a frozen monocular VFM (Depth-Anything-V2~\cite{dav2} / DINOv3~\cite{dinov3})---reaches top accuracy on ETH3D, KITTI, and Middlebury while being $1.8{-}6.7\times$ faster than competitors. However, WAFT discards explicit matching evidence: its encoder features are \emph{not} matching costs (we verify this in Sec.~\ref{sec:exp}), and all correspondence reasoning is packed into the ViT decoder, which is costly and slow to converge in textureless, repetitive, and large-disparity regions.
+
+\textbf{WAVE-Stereo}~\cite{wave} observed that correlation volumes and feature warping are \emph{complementary} and unified them in a GeoWarp Correspondence Encoder, with Periodic Global Context Propagation (PGCP) to compensate the ConvGRU's local receptive field. Critically, WAVE-Stereo operates in a \emph{lightweight, VFM-free, ConvGRU-based} regime (MobileNetV2 at 1/4 resolution, 66 ms), trading accuracy for speed (ETH3D Bad-2.0 of $0.86$ vs.\ WAFT's $0.32$).
+
+The quadrant that WAVE-Stereo leaves open is precisely where WAFT excels: the \emph{VFM + ViT, high-accuracy} regime. We ask: \emph{if explicit matching evidence is injected into a VFM + ViT warping pipeline, does it help, and in what form?} Our contributions are:
+
+\begin{itemize}
+\item \textbf{FusionWarp-Stereo}, augmenting WAFT with three learnable modules---MatchingBranch, GlobalMatcher, SparseCorrAnchor---plus GatedFusion and a token-sparse ViT, all zero-initialized for surgical safety.
+\item A \textbf{cross-regime study} with three falsifiable hypotheses (Table~\ref{tab:hyp}): (H1) non-aggregated correlation outperforms aggregated 3D volumes; (H2) ViT native global attention makes PGCP redundant; (H3) a small matching branch suffices to make VFM features matching-friendly.
+\item \textbf{Preliminary ablations} supporting H1, and \textbf{efficiency analysis} showing only $+2.0\%$ FLOPs and $+0.2\%$ memory at $+0.11\%$ parameters.
+\end{itemize}
+
+\begin{table}[t]
+\centering
+\caption{Three falsifiable hypotheses distinguishing this work from WAVE-Stereo.}
+\label{tab:hyp}
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & \textbf{WAVE-Stereo} & \textbf{FusionWarp (ours)} \\
+\midrule
+Matching evidence & aggregated GE volume & non-aggregated corr anchor \\
+Global context & PGCP (periodic patch) & ViT native (per-iteration) \\
+Backbone & MobileNetV2 (VFM-free) & DAv2/DINOv3 (VFM) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ===================== 2. Related Work =====================
+\section{Related Work}
+\noindent\textbf{Cost-volume stereo.} PSMNet~\cite{psmnet}, GwcNet~\cite{gwcnet}, ACVNet~\cite{acvnet}, and IGEV-Stereo~\cite{igev} construct explicit correlation tensors and regularize them with 3D CNNs, dominating in-domain accuracy at high cost. \textbf{Iterative refinement.} RAFT-Stereo~\cite{raftstereo} and CREStereo~\cite{crestereo} use a ConvGRU over a correlation pyramid; Selective-Stereo~\cite{selective} updates only selected regions. \textbf{Global matching.} GMFlow~\cite{gmflow} showed that all-pairs softmax matching removes the need for a 4D volume; STTR~\cite{sttr} used cross-attention. \textbf{Warping-only and VFM.} WAFT-Stereo~\cite{waft} eliminated cost volumes with iterative warping on a frozen VFM; MonSter and FoundationStereo~\cite{foundation} also exploit VFM priors. \textbf{Unifying correlation and warping.} WAVE-Stereo~\cite{wave} unified both in a ConvGRU with PGCP. We differ in regime (VFM + ViT) and in injecting \emph{non-aggregated} correlation (H1).
+
+% ===================== 3. Method =====================
+\section{Method}
+\subsection{Preliminaries: WAFT-Stereo}
+Given rectified images $I_L, I_R$, a shared encoder (DAv2/DINOv3, frozen with LoRA) produces context features $f_1, f_2$ and a hidden state $net$ at 1/2 resolution. An initial disparity is produced by a \emph{prop} branch that classifies disparity into bins with soft-argmax. Then $T$ iterations refine it:
+\begin{equation}
+\begin{aligned}
+d &\leftarrow \mathrm{detach}(d), \quad \tilde{f}_2 = \mathrm{warp}(f_2, d),\\
+net &= \delta\text{-proj}\big([f_1, \tilde{f}_2, net, d]\big),\\
+net &= \delta\text{-decoder}(net), \quad d \leftarrow d + \mathrm{disp\text{-}head}(net),
+\end{aligned}
+\label{eq:waf}
+\end{equation}
+followed by RAFT-style convex upsampling. The update input $[f_1, \tilde{f}_2, net, d]$ contains \emph{no explicit matching evidence}: the only cross-view signal is the warped feature $\tilde{f}_2$.
+
+\subsection{MatchingBranch}
+We found (Sec.~\ref{sec:exp}) that VFM features are \emph{not} matching costs: after GT alignment, the argmax of cosine similarity lands correctly only $46{-}55\%$ of the time. We therefore add a lightweight CNN \texttt{MatchingBranch} (32 channels, stride 4, $\sim$30K params) that extracts matching-friendly features $m_1, m_2$ directly from raw images.
+
+\subsection{GlobalMatcher}
+On 1/8-scale features, a learnable QKV cross-attention layer (left$\leftrightarrow$right, shared weights) enhances features against textureless/occlusion ambiguity, followed by full-range correlation with soft-argmax:
+\begin{equation}
+C(x,d)=\langle \hat{f}_1(x),\hat{f}_2(x-d)\rangle,\quad
+d_{gm}=\sum_d d\cdot\mathrm{softmax}_d\,C(x,d).
+\label{eq:gm}
+\end{equation}
+$d_{gm}$ is upsampled to 1/2 resolution as the initial disparity (replacing prop bins), and the cross-attended features are projected into a global-context feature $g_{feat}$ at 1/2 resolution.
+
+\subsection{SparseCorrAnchor}
+At each iteration, within a narrow band $\pm R$ around the current disparity, we compute group-wise correlation (channels split into $G$ groups, normalized dot product) between $m_1$ and warped $m_2$:
+\begin{equation}
+A(x)=\Big[\mathrm{gcorr}_G\big(m_1(x),\,\mathrm{warp}(m_2,d(x)+o)\big)\Big]_{o=-R}^{R},
+\label{eq:anchor}
+\end{equation}
+aggregated by a zero-initialized $3{\times}3$ convolution into an anchor feature added to the $\delta$-proj output. Unlike WAVE-Stereo's geometry-encoding volume, we apply \emph{no} 3D/2D aggregation over the disparity dimension (H1). A \texttt{GEVCostAnchor} variant with separable 3D aggregation is kept for controlled ablation.
+
+\subsection{GatedFusion}
+The anchor (local matching) and global context $g_{feat}$ are fused by a learnable spatial gate:
+\begin{equation}
+g=\sigma\big(\mathrm{conv}([A, g_{feat}])\big),\quad
+F = g\odot A + (1-g)\odot g_{feat},
+\label{eq:gate}
+\end{equation}
+scaled by a zero-initialized parameter so that $F=0$ at initialization (surgical safety).
+
+\subsection{TokenSparseVitIter}
+The WAFT $\delta$-decoder is a timm ViT with LoRA. We augment it with a token-level saliency gate after each block:
+\begin{equation}
+h' = tok + \gamma\odot\big(\mathrm{blk}(tok)-tok\big),\quad
+\gamma = 2\,\sigma\big(\mathrm{saliency}(tok)\big),
+\label{eq:sparse}
+\end{equation}
+where \texttt{saliency} is zero-initialized, so $\gamma=1$ at initialization (bit-identical to the plain ViT). This gives the ViT a selective-update capability that a ConvGRU cannot express (H2).
+
+\subsection{Training Objective}
+We keep WAFT's mixture-of-Laplace loss~\cite{searaft} with exponential weighting over iterations, plus the initial-disparity KL loss. All new modules are trainable; the VFM backbone stays frozen with LoRA.
+
+% ===================== 4. Experiments =====================
+\section{Experiments}
+\label{sec:exp}
+\subsection{Setup}
+Training uses the 12-dataset mix from WAFT's config (SceneFlow, TartanAir, CREStereo, FSD, etc.); evaluation on ETH3D, KITTI 2012/2015, Middlebury. Backbone is DAv2-Small/DINOv3-Small frozen with LoRA (rank 8), patch size 8, 3 delta iterations, max disparity 800. Metrics: EPE, Bad-1px/3px, D1, plus FLOPs and peak memory.
+
+\subsection{Preliminary Ablations (synthetic POC)}
+\emph{Honest scope:} the following come from a self-contained synthetic POC (96$\times$128 random-texture pairs, 120 steps, fair init). They validate \emph{mechanisms}, not final accuracy; full-scale results are reported separately.
+
+\noindent\textbf{(a) Are VFM features matching costs?} After GT alignment, the argmax of cosine similarity lands correctly only $46{-}55\%$ of the time, versus $87\%$ after training a 34K-parameter MatchingBranch---matching evidence must be \emph{learned}, not read off the frozen VFM.
+
+\noindent\textbf{(b) Does matching evidence help?} Table~\ref{tab:poc} ablates the anchor on the synthetic POC. Any anchor improves over pure warp, and the non-aggregated correlation anchor is best, supporting H1.
+
+\begin{table}[t]
+\centering
+\caption{Synthetic POC anchor ablation. Non-aggregated correlation beats 3D aggregation (H1).}
+\label{tab:poc}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Config & Params & EPE (last) & rel. to no-anchor \\
+\midrule
+no\_anchor (pure warp) & 269.6K & 2.430 & --- \\
+corr (non-aggregated) & 269.6K & \textbf{1.850} & \textbf{$+23.9\%$} \\
+gev-full3d (aggregated) & 254.0K & 2.092 & $+13.9\%$ \\
+gev-sep3d (separable 3D) & 252.5K & 1.937 & $+20.3\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{(c) GlobalMatcher initialization.} On the synthetic POC, replacing bins classification with GlobalMatcher's full-range regression lowers initial EPE from $\sim$28 px to $\sim$23 px at random init, indicating a better convergence initialization.
+
+\subsection{Efficiency Analysis (measured)}
+Measured at 480$\times$640, batch 1, RTX 5060 (Table~\ref{tab:eff}).
+
+\begin{table}[t]
+\centering
+\caption{Forward FLOPs and peak memory. Fusion adds $+2.0\%$ FLOPs and $+0.2\%$ memory.}
+\label{tab:eff}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Config & FLOPs & Peak mem. & Params \\
+\midrule
+WAFT baseline & 826.0 G & 1948 MB & 77.05M \\
+$+$corr anchor & 832.4 G & 1952 MB & 77.11M \\
+full fusion & 842.7 G & 1952 MB & 77.12M \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The per-module FLOPs: MatchingBranch 1.43 G, SparseCorrAnchor 1.19 G, GlobalMatcher 9.87 G (dominated by 100 full-range warp$+$corr), GatedFusion 0.13 G. GlobalMatcher is the single FLOPs hotspot (59\% of the fusion overhead) and can be reduced by lowering disparity candidates or vectorizing the correlation.
+
+\subsection{Full-Scale Training (ongoing)}
+Full-scale end-to-end training (400K steps, 8 GPUs) is in progress. We will report: (i) zero-shot EPE on ETH3D/KITTI/Middlebury per configuration; (ii) H1/H2/H3 hypothesis tests at scale; (iii) convergence with/without the GlobalMatcher initialization.
+
+% ===================== 5. Conclusion =====================
+\section{Conclusion}
+We presented FusionWarp-Stereo, a ViT-based iterative stereo framework that injects explicit matching evidence into the warping-only WAFT baseline via three learnable modules, fused by a learnable gate and decoded by a token-sparse ViT. We positioned the work as a cross-regime study complementing WAVE-Stereo, with three falsifiable hypotheses. Preliminary synthetic ablations support the central claim that non-aggregated correlation is sufficient in a ViT-based decoder, at negligible cost ($+2.0\%$ FLOPs, $+0.2\%$ memory, $+0.11\%$ parameters). Full-scale training will validate the hypotheses on real benchmarks.
+
+% ===================== 致谢 + 利益冲突（required）=====================
+\section*{Acknowledgment}
+No funding was received for conducting this study. The authors have no relevant financial or nonfinancial interests to disclose.
+
+% ===================== 伦理合规声明（required，标题一字不差）=====================
+\section*{Compliance with Ethical Standards}
+This is a numerical simulation study for which no ethical approval was required.
+
+% ===================== 参考文献 =====================
+\begin{thebibliography}{15}
+
+\bibitem{psmnet}
+J.-R. Chang and Y.-S. Chen, ``Pyramid stereo matching network,'' in \emph{Proc. CVPR}, 2018.
+
+\bibitem{gwcnet}
+X. Guo, K. Yang, W. Yang, X. Wang, and H. Li, ``Group-wise correlation stereo network,'' in \emph{Proc. CVPR}, 2019.
+
+\bibitem{acvnet}
+G. Xu, J. Cheng, P. Guo, and X. Yang, ``Attention concatenation volume for accurate and efficient stereo matching,'' in \emph{Proc. CVPR}, 2022.
+
+\bibitem{igev}
+G. Xu, X. Wang, X. Ding, and X. Yang, ``Iterative geometry encoding volume for stereo matching,'' in \emph{Proc. CVPR}, 2023.
+
+\bibitem{raftstereo}
+L. Lipson, Z. Teed, and J. Deng, ``RAFT-Stereo: Multilevel recurrent field transforms for stereo matching,'' in \emph{Proc. 3DV}, 2021.
+
+\bibitem{crestereo}
+J. Li et al., ``Practical stereo matching via cascaded recurrent network with adaptive correlation,'' in \emph{Proc. CVPR}, 2022.
+
+\bibitem{selective}
+X. Wang et al., ``Selective-Stereo: Adaptive frequency information selection for stereo matching,'' in \emph{Proc. NeurIPS}, 2023.
+
+\bibitem{searaft}
+Y. Wang, L. Lipson, and J. Deng, ``SEA-RAFT: Simple, efficient, accurate RAFT for optical flow,'' in \emph{Proc. CVPR}, 2024.
+
+\bibitem{gmflow}
+H. Xu, J. Zhang, J. Cai, H. Rezatofighi, and D. Tao, ``GMFlow: Learning optical flow via global matching,'' in \emph{Proc. CVPR}, 2022.
+
+\bibitem{sttr}
+Z. Li et al., ``Revisiting stereo depth estimation from a sequence-to-sequence perspective with transformers,'' in \emph{Proc. ICCV}, 2021.
+
+\bibitem{waft}
+Y. Wang and J. Deng, ``WAFT-Stereo: Warping-alone field transforms for stereo matching,'' \emph{arXiv:2603.24836}, 2026.
+
+\bibitem{dav2}
+L. Yang, B. Kang, Z. Huang, et al., ``Depth Anything V2,'' in \emph{Proc. NeurIPS}, 2024.
+
+\bibitem{dinov3}
+M. Oquab et al., ``DINOv3: Releasing strong vision models,'' \emph{arXiv:2504.13807}, 2025.
+
+\bibitem{foundation}
+B. Wen et al., ``FoundationStereo: Zero-shot stereo matching,'' in \emph{Proc. CVPR}, 2025.
+
+\bibitem{wave}
+Z. Liu, Y. He, and X. Gong, ``WAVE-Stereo: Warp-aligned volume encoding for stereo matching,'' \emph{arXiv:2607.13674}, 2026.
+
+\end{thebibliography}
+
+\end{document}
