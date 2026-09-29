@@ -37,6 +37,7 @@ _CN.WAFT.FEATURE_ENCODER.LORA_ALPHA = None
 _CN.WAFT.ITERATIVE_MODULE = CN()
 _CN.WAFT.MAX_DISP = 320
 _CN.WAFT.LOSS = None
+_CN.WAFT.GRADIENT_LOSS_WEIGHT = 0.5   # 升级3：梯度匹配损失权重（0 = 关闭）
 
 _CN.WAFT.ITERATIVE_MODULE.TASK = []
 
@@ -65,6 +66,8 @@ _CN.WAFT.FUSION.USE_ANCHOR = True
 _CN.WAFT.FUSION.USE_GLOBAL_INIT = False
 # 用 GatedFusion 门控融合「局部相关锚」与「全局上下文 g_feat」（深度融合，隐含 USE_ANCHOR）
 _CN.WAFT.FUSION.USE_GATED_FUSION = False
+# 升级1（DPI）：用 DAv2 单目深度做视差 warm start（仅 dav2 encoder 生效）
+_CN.WAFT.FUSION.USE_DPI = False
 # 锚类型："corr"（无聚合相关，推荐）| "gev"（可分离 3D 聚合，对抗性消融对照）
 _CN.WAFT.FUSION.ANCHOR_KIND = "corr"
 # 匹配分支（方向3）通道数，输出 1/4 分辨率
@@ -72,6 +75,7 @@ _CN.WAFT.FUSION.MATCH_CH = 32
 # SparseCorrAnchor 窄带半径 / 分组数
 _CN.WAFT.FUSION.CORR_RADIUS = 4
 _CN.WAFT.FUSION.CORR_GROUPS = 8
+_CN.WAFT.FUSION.CORR_MULTI_SCALE = False   # 升级2：True 时 1/4+1/8 多尺度相关锚
 # GEVCostAnchor 参数（仅 ANCHOR_KIND="gev" 生效）
 _CN.WAFT.FUSION.GEV_AGG_KIND = "sep3d"   # "sep3d" | "full3d"
 _CN.WAFT.FUSION.GEV_K = 9

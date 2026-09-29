@@ -67,25 +67,48 @@ class SparseCorrAnchor(nn.Module):
 
     与 WAVE-Stereo 的几何编码体积(带 2D/3D 聚合)不同：这里不做任何视差维/空间维聚合，
     只保留逐点相关分布，经零初始化 1×1/3×3 卷积映射到迭代隐空间。
+
+    升级2（multi_scale=True）：在 1/4 和 1/8 两个尺度各做一条无聚合窄带相关，
+    上采样对齐后 concat，提供多尺度匹配证据（呼应 LinStereo 的 HSCV，但仍无聚合）。
     """
 
-    def __init__(self, C, G=8, R=4, out_ch=48):
+    def __init__(self, C, G=8, R=4, out_ch=48, multi_scale=False):
         super().__init__()
         assert C % G == 0, f"MatchingBranch 通道 {C} 必须能被分组数 {G} 整除"
-        self.G, self.R = G, R
-        self.head = nn.Conv2d((2 * R + 1) * G, out_ch, 3, padding=1)
-        # 零初始化 → 前向恒为 0，等价原版
-        nn.init.zeros_(self.head.weight)
-        nn.init.zeros_(self.head.bias)
+        self.G, self.R, self.multi_scale = G, R, multi_scale
+        if multi_scale:
+            half = out_ch // 2
+            self.head1 = nn.Conv2d((2 * R + 1) * G, half, 3, padding=1)
+            self.head2 = nn.Conv2d((2 * R + 1) * G, out_ch - half, 3, padding=1)
+            for h in (self.head1, self.head2):
+                nn.init.zeros_(h.weight)
+                nn.init.zeros_(h.bias)
+        else:
+            self.head = nn.Conv2d((2 * R + 1) * G, out_ch, 3, padding=1)
+            nn.init.zeros_(self.head.weight)
+            nn.init.zeros_(self.head.bias)
 
-    def forward(self, m1, m2, disp):
-        """m1/m2: (B, C, h, w) 匹配特征(1/4)；disp: (B, 1, h, w) 同尺度视差。"""
+    def _corr(self, m1, m2, disp, head):
         sims = []
         for o in range(-self.R, self.R + 1):
             w = disp_warp(m2, disp + o, padding_mode='zeros')
             sims.append(group_corr(m1, w, self.G))
         cost = torch.cat(sims, dim=1)  # (B, (2R+1)*G, h, w)
-        return self.head(cost)
+        return head(cost)
+
+    def forward(self, m1, m2, disp):
+        """m1/m2: (B, C, h, w) 匹配特征(1/4)；disp: (B, 1, h, w) 同尺度视差。"""
+        if not self.multi_scale:
+            return self._corr(m1, m2, disp, self.head)
+        # 尺度 1：1/4
+        f1 = self._corr(m1, m2, disp, self.head1)
+        # 尺度 2：1/8（下采样 2×，视差 ×0.5）
+        m1_s = F.avg_pool2d(m1, 2, 2)
+        m2_s = F.avg_pool2d(m2, 2, 2)
+        disp_s = F.avg_pool2d(disp, 2, 2) * 0.5
+        f2 = self._corr(m1_s, m2_s, disp_s, self.head2)
+        f2 = F.interpolate(f2, size=m1.shape[-2:], mode='bilinear', align_corners=True)
+        return torch.cat([f1, f2], dim=1)
 
 
 # --------------------------------------------------------------------------- #

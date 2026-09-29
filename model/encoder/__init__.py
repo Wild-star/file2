@@ -1,7 +1,7 @@
 from .dinov3 import DINOv3Encoder
 from .dav2 import DAv2Encoder
 
-def fetch_feature_encoder(cfg):
+def fetch_feature_encoder(cfg, return_depth=False):
     if cfg.TYPE == 'dinov3':
         factor = 16
         encoder_lora_rank = cfg.LORA_RANK
@@ -21,6 +21,7 @@ def fetch_feature_encoder(cfg):
             model_name=cfg.ARCH,
             alpha=encoder_lora_alpha,
             r=encoder_lora_rank,
+            return_depth=return_depth,
         )
         encoder_dim = encoder.output_dim
     else:

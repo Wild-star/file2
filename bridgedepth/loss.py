@@ -45,6 +45,31 @@ def init_loss(output, target, max_disp=192):
     kl_loss = -(torch.log(torch.clamp(prob, min=1e-6)) * label).sum(dim=1)
     return kl_loss[valid.bool() & ~torch.isnan(kl_loss)].mean()
 
+def gradient_loss(output, target, scales=2):
+    """多尺度梯度匹配损失（NBS 的 L_gm）：惩罚预测误差的空间梯度，
+    鼓励误差在平滑区平滑、在边缘处锐利（而非弥散的小噪声）。"""
+    disp_pred = output['disp_pred']
+    disp_gt = target['disp'].to(disp_pred.device)
+    valid = (target['valid'] >= 0.5).to(disp_pred.device)
+
+    loss = 0.0
+    diff = disp_pred - disp_gt
+    v = valid
+    for k in range(scales):
+        grad_x = diff[:, :, 1:] - diff[:, :, :-1]   # (B, H, W-1)
+        grad_y = diff[:, 1:, :] - diff[:, :-1, :]   # (B, H-1, W)
+        vx = v[:, :, 1:] & v[:, :, :-1]
+        vy = v[:, 1:, :] & v[:, :-1, :]
+        if vx.sum() > 0:
+            loss = loss + grad_x.abs()[vx].mean()
+        if vy.sum() > 0:
+            loss = loss + grad_y.abs()[vy].mean()
+        if k < scales - 1:
+            diff = F.interpolate(diff.unsqueeze(0), scale_factor=0.5, mode='bilinear', align_corners=True).squeeze(0)
+            v = F.interpolate(v.float().unsqueeze(0), scale_factor=0.5, mode='nearest').squeeze(0).bool()
+    return loss / scales
+
+
 class WAFTCriterion(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -56,6 +81,12 @@ class WAFTCriterion(nn.Module):
         elif 'wprob' in self.cfg.WAFT.LOSS[0]:
             self.weight_dict.update({'mixlap': 1.0})
             self.weight_dict.update({'kl': 1.0})
+        # 升级3：梯度匹配损失权重（0 = 关闭）
+        self.grad_weight = float(getattr(cfg.WAFT, 'GRADIENT_LOSS_WEIGHT', 0.5))
+        if self.grad_weight > 0:
+            self.weight_dict.update({'grad': self.grad_weight})
+        # 升级1：DPI 辅助监督（仅 use_dpi 时 loss_dict 里有 'dpi'）
+        self.weight_dict.update({'dpi': 1.0})
         
     def forward(self, outputs, targets, log):
         loss_dict = {}
@@ -75,6 +106,17 @@ class WAFTCriterion(nn.Module):
             loss = mixlap_loss(outputs, targets, loss_gamma=0.9, max_disp=self.cfg.WAFT.MAX_DISP)
             loss_dict.update({'mixlap': loss})
             metrics.update({'mixlap': loss.item()})
+            # 升级3：梯度匹配损失
+            if self.grad_weight > 0:
+                loss = gradient_loss(outputs, targets)
+                loss_dict.update({'grad': loss})
+                metrics.update({'grad': loss.item()})
+            # 升级1：DPI 辅助监督（仅 use_dpi 时 outputs 有 'dpi_disp'）
+            if 'dpi_disp' in outputs:
+                dpi_epe = (outputs['dpi_disp'] - targets['disp']).abs()
+                loss = dpi_epe[valid].mean()
+                loss_dict.update({'dpi': loss})
+                metrics.update({'dpi': loss.item()})
         elif 'wprob' in self.cfg.WAFT.LOSS[0]:
             n_bins = (int)(self.cfg.WAFT.LOSS[0].split('_')[-1]) + 1
             tasks = self.cfg.WAFT.ITERATIVE_MODULE.TASK

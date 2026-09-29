@@ -25,7 +25,10 @@ class WAFT(nn.Module):
         self.task = cfg.WAFT.ITERATIVE_MODULE.TASK
         self.iters = len(self.task)
         self.n_bins = (int)(cfg.WAFT.LOSS[0].split('_')[-1]) + 1
-        self.encoder, self.enc_dim, self.factor = fetch_feature_encoder(cfg.WAFT.FEATURE_ENCODER)
+        # 升级1（DPI）：提前读 fusion 配置，判断 encoder 是否返回单目深度
+        _fusion_cfg = cfg.WAFT.FUSION if 'FUSION' in cfg.WAFT else None
+        self.use_dpi = bool(_fusion_cfg is not None and _fusion_cfg.ENABLED and getattr(_fusion_cfg, 'USE_DPI', False))
+        self.encoder, self.enc_dim, self.factor = fetch_feature_encoder(cfg.WAFT.FEATURE_ENCODER, return_depth=self.use_dpi)
         self.hidden_dim = self.enc_dim
         self.prop_decoder = fetch_iterative_module(cfg.WAFT.ITERATIVE_MODULE.PROP_ITER, input_dim=self.hidden_dim)
         self.prop_proj = Mlp(self.enc_dim*2, self.hidden_dim, self.hidden_dim, use_conv=True)
@@ -55,7 +58,8 @@ class WAFT(nn.Module):
             self.matching_branch = MatchingBranch(ch=mch, out_ch=mch)
             if self.anchor_kind == 'corr':
                 self.corr_anchor = SparseCorrAnchor(
-                    C=mch, G=fusion_cfg.CORR_GROUPS, R=fusion_cfg.CORR_RADIUS, out_ch=self.hidden_dim)
+                    C=mch, G=fusion_cfg.CORR_GROUPS, R=fusion_cfg.CORR_RADIUS, out_ch=self.hidden_dim,
+                    multi_scale=bool(getattr(fusion_cfg, 'CORR_MULTI_SCALE', False)))
             elif self.anchor_kind == 'gev':
                 self.gev_anchor = GEVCostAnchor(
                     C=mch, G=4, K=fusion_cfg.GEV_K, R=fusion_cfg.GEV_R, Cv=8,
@@ -71,6 +75,15 @@ class WAFT(nn.Module):
 
         if self.use_gated_fusion:
             self.gated_fusion = GatedFusion(C=self.hidden_dim)
+
+        # 升级1（DPI）：深度 → 视差 warm start 头（零初始化 → 初始等价原版）
+        if self.use_dpi:
+            self.dpi_head = nn.Sequential(
+                nn.Conv2d(1, self.hidden_dim, 3, padding=1), nn.SiLU(inplace=True),
+                nn.Conv2d(self.hidden_dim, 1, 1),
+            )
+            nn.init.zeros_(self.dpi_head[-1].weight)
+            nn.init.zeros_(self.dpi_head[-1].bias)
 
     def normalize_image(self, img):
         '''
@@ -98,7 +111,7 @@ class WAFT(nn.Module):
         image1 = padder.pad(image1)
         image2 = padder.pad(image2)
 
-        fmap1, fmap2, net = self.encoder(torch.stack([image1, image2], dim=1))
+        fmap1, fmap2, net, depth = self.encoder(torch.stack([image1, image2], dim=1))
         n, _, h, w = fmap1.shape
 
         # ---- 匹配分支（方向3）：从原始图像提匹配友好特征（1/4 分辨率）----
@@ -127,6 +140,17 @@ class WAFT(nn.Module):
             d_gm, g_feat = self.global_matcher(fmap1, fmap2)  # (B,1,H/2,W/2), (B,C,H/2,W/2)
             if self.use_global_init:
                 disp = d_gm
+
+        # ---- 升级1（DPI）：单目深度 warm start（零初始化 → 初始等价原版）----
+        if self.use_dpi and depth is not None:
+            depth_up = F.interpolate(depth.unsqueeze(1), size=disp.shape[-2:],
+                                     mode='bilinear', align_corners=True)  # 1/4 → 1/2
+            disp_dpi = self.dpi_head(depth_up)   # (B,1,H/2,W/2)，深度 → 视差增量
+            disp = disp + disp_dpi
+            # 辅助监督输出（迭代里 detach 会切断初始视差梯度，故单独输出供损失监督）
+            disp_dpi_full = F.interpolate(disp_dpi * 2, scale_factor=2,
+                                          mode='bilinear', align_corners=True)
+            output['dpi_disp'] = padder.unpad(disp_dpi_full).squeeze(1)
 
         if disp_init is not None:
             disp = padder.pad(disp_init.unsqueeze(1))

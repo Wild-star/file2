@@ -1,7 +1,22 @@
+# =====================================================================
+# FusionWarp-Stereo 训练配置（主方案：无聚合相关锚 corr）
+# =====================================================================
+# 相对 baseline 的三处关键修正（针对之前 EPE 卡 1 / 后期崩溃）：
+#   1. batch 16 → BASE_LR 降半到 0.00025（原版 batch32 + 0.0005 的线性缩放）
+#   2. 只用 sceneflow，与 baseline 公平对照
+#   3. GM_NDISP 从 null(=100) 改成 24（=192//8，修正候选范围与训练视差不匹配）
+#
+# 消融切换（改 FUSION 段即可，其余不动）：
+#   ① 无聚合 vs 3D聚合 : ANCHOR_KIND  corr(推荐) | gev(对照)
+#   ② GlobalMatcher起点 : USE_GLOBAL_INIT  False | True
+#   ③ 门控融合         : USE_GATED_FUSION  False | True（需同时 USE_GLOBAL_INIT=True）
+#   ④ token稀疏解码器  : DELTA_ITER.TYPE  vit | vit_sparse
+# =====================================================================
 ALGORITHM: "waft"
 WAFT:
   MAX_DISP: 800
   LOSS: ['mixlap_40']
+  GRADIENT_LOSS_WEIGHT: 0.5   # 升级3：梯度匹配损失（0=关闭）
   FEATURE_ENCODER:
     TYPE: "dav2"
     ARCH: "vits"
@@ -19,21 +34,23 @@ WAFT:
       PATCH_SIZE: 8
   FUSION:
     ENABLED: True
-    USE_ANCHOR: True          # 方向1：注入相关锚
-    USE_GLOBAL_INIT: False    # 方向2：True 时用 GlobalMatcher 替换 bins 分类初始视差
-    USE_GATED_FUSION: False   # 深度融合：True 时 GatedFusion 门控融合「局部锚 + 全局上下文」
-    ANCHOR_KIND: "corr"       # "corr"(无聚合) | "gev"(3D 聚合，对抗性消融对照)
-    MATCH_CH: 32              # 方向3：匹配分支通道数
-    CORR_RADIUS: 4
-    CORR_GROUPS: 8
-    GEV_AGG_KIND: "sep3d"
+    USE_ANCHOR: True          # 主方案：注入相关锚（方向1）
+    USE_GLOBAL_INIT: False    # 方向2：True 时用 GlobalMatcher 替换 bins 分类起点
+    USE_GATED_FUSION: False   # 深度融合：True 时 GatedFusion 融合「局部锚 + 全局上下文」
+    USE_DPI: False            # 升级1：True 时 DAv2 单目深度 warm start
+    ANCHOR_KIND: "corr"       # "corr"(无聚合,推荐) | "gev"(可分离3D聚合,消融①对照)
+    MATCH_CH: 32              # 匹配分支通道数（输出 1/4 分辨率）
+    CORR_RADIUS: 4            # 相关锚窄带半径 ±R
+    CORR_GROUPS: 8            # group-wise 相关分组数（须整除 MATCH_CH）
+    CORR_MULTI_SCALE: False   # 升级2：True 时 1/4+1/8 多尺度相关锚
+    GEV_AGG_KIND: "sep3d"     # gev 聚合方式："sep3d" | "full3d"
     GEV_K: 9
     GEV_R: 8
     GM_HEADS: 4
-    GM_NDISP: null            # null = MAX_DISP // 8 = 100
+    GM_NDISP: 24              # 修正：=192//8=24，匹配训练视差上限(192)，而非 MAX_DISP=800
 DATASETS:
-  TRAIN: ("sceneflow", "tartanair", "crestereo", "fsd", "sintelstereo", "fallingthings", "vkitti2", "unrealstereo4k", "wmgstereo", "carlahighres", "spring", "tartanground")
-  MUL: (1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)
+  TRAIN: ("sceneflow",)       # 主方案先跑 sceneflow 与 baseline 对照
+  MUL: (1,)
   CROP_SIZE: [480, 640]
   TEST: ("things",)
 TEST:
@@ -44,7 +61,7 @@ TEST:
 SOLVER:
   MIX_PRECISION: True
   NO_RESUME_OPTIMIZER: True
-  IMS_PER_BATCH: 32
+  IMS_PER_BATCH: 16
   MAX_ITER: 400000
   CHECKPOINT_PERIOD: 10000
-  BASE_LR: 0.0005
+  BASE_LR: 0.00025           # 修正：batch16 → LR 降半（原版 batch32 + 0.0005）

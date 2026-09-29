@@ -64,4 +64,4 @@ class DINOv3Encoder(nn.Module):
         hidden_feats = self.hidden_upsample(hidden_feats)
         hidden = hidden_feats[0]
 
-        return fmap1, fmap2, hidden
+        return fmap1, fmap2, hidden, None

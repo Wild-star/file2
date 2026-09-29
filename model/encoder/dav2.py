@@ -18,9 +18,10 @@ DEPTH_ANYTHING_CONFIGS = {
     'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]}
 }
 class DAv2Encoder(nn.Module):
-    def __init__(self, model_name='vits', alpha=None, r=None):
+    def __init__(self, model_name='vits', alpha=None, r=None, return_depth=False):
         super().__init__()
         self.model_name = model_name
+        self.return_depth = return_depth
         depth_anything = DepthAnythingV2(**DEPTH_ANYTHING_CONFIGS[model_name])
         if os.path.exists(f'depth-anything-ckpts/depth_anything_v2_{model_name}.pth'):
             depth_anything.load_state_dict(torch.load(f'depth-anything-ckpts/depth_anything_v2_{model_name}.pth', map_location='cpu'))
@@ -41,6 +42,9 @@ class DAv2Encoder(nn.Module):
             target_modules=["qkv", "proj"]
         )
         self.encoder = get_peft_model(depth_anything.pretrained, lora_config)
+        # 升级1（DPI）：保留 DPT 深度头，用于输出单目深度做 warm start
+        if return_depth:
+            self.depth_head = depth_anything.depth_head
         self.fmap_proj = ProjFeats(self.dim, self.out_c, lvl=-3)
         self.fmap_upsample = UpsampleFeats(self.output_dim, self.out_c)
         self.hidden_proj = ProjFeats(self.dim*2, self.out_c, lvl=-3)
@@ -54,6 +58,15 @@ class DAv2Encoder(nn.Module):
         
         imgs = F.interpolate(imgs, (h*14, w*14), mode='bilinear', align_corners=True)
         feats = self.encoder.get_intermediate_layers(imgs, self.idx, return_class_token=True)
+
+        # 升级1（DPI）：单目深度（左图），1/4 分辨率
+        depth = None
+        if self.return_depth:
+            depth = self.depth_head(feats, h, w, return_intermediate=False)
+            depth = F.relu(depth).squeeze(1)            # (B*N, 4h, 4w)
+            depth = depth.reshape(B, N, *depth.shape[1:])
+            depth = depth[:, 0]                          # 左图 (B, 4h, 4w)
+
         fmap_feats = [rearrange(x[0], 'bn (h w) c -> bn c h w', h=h, w=w) for x in feats]
         fmap_feats = self.fmap_proj(fmap_feats)
         fmap_feats = self.fmap_upsample(fmap_feats)
@@ -66,7 +79,7 @@ class DAv2Encoder(nn.Module):
         hidden_feats = self.hidden_upsample(hidden_feats)
         hidden = hidden_feats[0]
 
-        return fmap1, fmap2, hidden
+        return fmap1, fmap2, hidden, depth
 
 if __name__ == '__main__':
     def count_parameters(model):
