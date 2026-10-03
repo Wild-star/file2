@@ -35,7 +35,7 @@ WAFT-Stereo 证明了「纯 feature-warping、无代价体」的可行性，但�
 | B1 | GatedFusion | ACVNet (2022) / CREStereo (2022)：空间门控融合 | A2 锚与全局上下文之间 | 局部 vs 全局证据权衡 | 置信 |
 | B2 | Uncertainty | U²Flow (2026) / URS-Stereo (2026)：逐像素 aleatoric 不确定性 | 迭代隐状态上的 σ 头，复用三处 | 难例自适应（遮挡/无纹理） | 置信 |
 | B3 | GlobalContext | GREAT-Stereo (ICCV 2025)：SA(空间)+MA(epipolar)+VA(体积) 注意力 | 迭代内、全局上下文注入 | 无纹理/重复纹理歧义 | 置信 |
-| C1 | TokenSparseViT | Selective-Stereo (2024) / DynamicViT：token 级选择性更新 | 替代 WAFT 的 `VitIter` 全量 token | 迭代算力冗余 | 效率 |
+| C1 | TokenSparseViT | DynamicViT (NeurIPS 2021)：token 级动态稀疏化 | 替代 WAFT 的 `VitIter` 全量 token | 迭代算力冗余 | 效率 |
 | C2 | 代价体训练蒸馏 | Removing Cost Volumes (ICCV 2025)：代价体训练后移除 | A2 的训练/推理分离 | 推理代价体冗余 | 效率 |
 
 ## 3. 逐模块迁移设计
@@ -93,7 +93,8 @@ WAFT-Stereo 证明了「纯 feature-warping、无代价体」的可行性，但�
 ### 3.3 效率流（Efficiency）
 
 #### C1 TokenSparseViT —— token 级选择性更新
-- **来源**：Selective-Stereo 的选择性更新 + DynamicViT 的 token 剪枝。
+- **来源**：DynamicViT（NeurIPS 2021, 2106.02034）的动态 token 稀疏化（Selective-Stereo 的核心
+  实为多频率融合 SRU+CSA，已归入 B1 佐证链，不属 token 稀疏）。
 - **短板**：WAFT 的 `VitIter` 对全量 token 做注意力，但逐轮视差增量高度稀疏（本仓库 P0 诊断）。
 - **缝合**：patch 化后 router 预测 saliency，`gate = σ(sal)`，`h' = tok + gate⊙(Attn(tok)-tok)`；
   训练加 `λ·mean(gate)` 鼓励稀疏，硬 top-k 版本推理跳过低 saliency token 的注意力。
