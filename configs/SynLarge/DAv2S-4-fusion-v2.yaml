@@ -1,0 +1,103 @@
+# =====================================================================
+# FusionWarp-Stereo 训练配置 v2 —— 8 模块完整融合（证据-置信-效率三线闭环）
+# =====================================================================
+# 对应 docs/paper_design_fusionwarp.md §2 的 8 个迁移模块（A1~C2）：
+#   A1 GlobalMatcher 全局匹配初始化      —— USE_GLOBAL_INIT  (GMFlow/SEA-RAFT)
+#   A2 CostAnchor 窄带代价体锚          —— USE_ANCHOR + ANCHOR_KIND  (RAFT-Stereo/IGEV)
+#   A3 解耦代价体聚合（空间×视差 2D）    —— ANCHOR_KIND:"gev" + GEV_AGG_KIND:"decoupled2d"  (DBStereo)
+#   B1 GatedFusion 门控融合             —— USE_GATED_FUSION  (ACVNet/CREStereo)
+#   B2 Uncertainty 逐像素不确定性        —— USE_UNCERTAINTY   (U²Flow/URS-Stereo)
+#   B3 GlobalContext 全局上下文注意力    —— USE_GLOBAL_CONTEXT  (GREAT-Stereo ICCV'25)
+#   C1 TokenSparseViT token 稀疏        —— DELTA_ITER.TYPE:"vit_sparse"  (DynamicViT NeurIPS'21)
+#   C2 代价体训练蒸馏（推理移除）         —— USE_COST_DISTILL   (Removing Cost Volumes ICCV'25)
+#
+# 融合闭环（见 paper_design §4）：
+#   证据闭环 = A1 全局初始 + A2/A3 局部代价体 → B1 门控融合成多尺度证据
+#   置信闭环 = B3 全局上下文 + B2 逐像素 σ → 共同调制 B1 门控与 A2 搜索半径
+#   效率闭环 = C1 稀疏（按 B2 σ 选 token）+ C2 蒸馏（按训练进度移除代价体）
+#
+# 关键修正（沿用 fusion-full.yaml 的教训）：
+#   1. batch 16 → BASE_LR 降半到 0.00025
+#   2. GM_NDISP = 24（=192//8，匹配训练视差上限 192）
+#   3. 只用 sceneflow，与 baseline 公平对照
+#
+# ⚠️ 训练流程（单因子归因，勿一次性全开归因）：
+#   ① 先 corr 锚单独（A2）确认锚有效 → ② 加 A1/B1 → ③ 加 B2/B3 → ④ 加 A3/C1/C2。
+#   每次只加一个开关，其余关闭，才能把精度变化归因到具体模块。
+# =====================================================================
+ALGORITHM: "waft"
+WAFT:
+  MAX_DISP: 800
+  LOSS: ['mixlap_40']
+  GRADIENT_LOSS_WEIGHT: 0.5          # 梯度匹配损失（升级3）
+  FEATURE_ENCODER:
+    TYPE: "dav2"
+    ARCH: "vits"
+    LORA_RANK: 8
+    LORA_ALPHA: 16
+  ITERATIVE_MODULE:
+    TASK: ['delta', 'delta', 'delta']
+    DELTA_ITER:
+      TYPE: "vit_sparse"              # C1：token 稀疏（DynamicViT）
+      ARCH: "vits"
+      PATCH_SIZE: 8
+    PROP_ITER:
+      TYPE: "vit"
+      ARCH: "vits"
+      PATCH_SIZE: 8
+  FUSION:
+    ENABLED: True
+
+    # ---- 证据流 ----
+    USE_ANCHOR: True                  # A2：窄带代价体锚
+    ANCHOR_KIND: "gev"                # "corr"(无聚合) | "gev"(带聚合，配 A3)
+    MATCH_CH: 32
+    CORR_RADIUS: 4                    # A2 窄带半径 R
+    CORR_GROUPS: 8                    # A2 组相关 G
+    CORR_MULTI_SCALE: True            # 1/4+1/8 多尺度相关锚（升级2）
+    GEV_K: 9                          # A2 代价体候选数
+    GEV_R: 8                          # A2 代价体半径
+    GEV_AGG_KIND: "decoupled2d"       # A3：空间×视差 2D 解耦聚合（DBStereo）
+                                      #     "full3d"(3D卷积) | "sep3d"(可分离3D) | "decoupled2d"(A3)
+
+    # ---- 置信流 ----
+    USE_GLOBAL_INIT: True             # A1：GlobalMatcher 全局匹配起点（GMFlow/SEA-RAFT）
+    USE_GATED_FUSION: True            # B1：门控融合「局部锚 + 全局上下文」（ACVNet）
+    USE_GLOBAL_CONTEXT: True          # B3：全局上下文注意力（GREAT-Stereo）
+    GC_USE_SA: True                   #   B3 空间注意力（spatial）
+    GC_USE_MA: True                   #   B3 epipolar 匹配注意力（matching）
+    GC_USE_VA: True                   #   B3 体积注意力（volume）
+    GC_HEADS: 4                       #   B3 注意力头数
+    USE_UNCERTAINTY: True             # B2：逐像素不确定性（U²Flow/URS-Stereo）
+    UNCERT_SIGMA_CH: 32               #   B2 σ 头通道
+    UNCERT_GATE_MOD: True             #   B2 σ 调制 B1 门控
+    UNCERT_RADIUS_MOD: True           #   B2 σ 自适应 A2 搜索半径
+    UNCERT_LOSS_MOD: True             #   B2 σ 调制损失权重（难例降权）
+    GM_HEADS: 4                       # A1 全局匹配注意力头数
+    GM_NDISP: 24                      # A1 候选范围 =192//8
+
+    # ---- 效率流 ----
+    USE_COST_DISTILL: True            # C2：代价体训练蒸馏（Removing Cost Volumes）
+    DISTILL_START_ITER: 200000        #   C2 蒸馏起始 iter（前段完整训练锚，后段蒸馏）
+    DISTILL_LOSS_WEIGHT: 0.1          #   C2 蒸馏损失权重（辅助监督 d_cv）
+    DISTILL_REMOVE_INFER: True        #   C2 推理时移除代价体分支
+
+    # ---- 既有升级（保留） ----
+    USE_DPI: True                     # DAv2 单目深度 warm start（升级1）
+DATASETS:
+  TRAIN: ("sceneflow",)
+  MUL: (1,)
+  CROP_SIZE: [480, 640]
+  TEST: ("things",)
+TEST:
+  EVAL_PERIOD: 10000
+  EVAL_THRESH: (['1.0', '3.0'],)
+  EVAL_MAX_DISP: [null,]
+  EVAL_ONLY_VALID: (True,)
+SOLVER:
+  MIX_PRECISION: True
+  NO_RESUME_OPTIMIZER: True
+  IMS_PER_BATCH: 16
+  MAX_ITER: 400000
+  CHECKPOINT_PERIOD: 10000
+  BASE_LR: 0.00025                  # batch16 → LR 降半
