@@ -243,3 +243,49 @@ token 稀疏在 seed1 反而有害（nosparse 2.024 < fusion 2.352）；锚在 s
 消融单种子不可复现，必须多种子 + 配对统计检验；(b) 负结果——光流 OT/σ 模块直接迁移
 在双目迭代框架不适用。要得到「模块稳健增益」的正结论，必须上真实数据（SceneFlow）+ 充分
 训练 + ≥10 种子 + 配对 t 检验，这在当前 CPU 环境不可行，须迁至 GPU。
+
+---
+
+## 6. 代价体 + 迭代 warp 融合的最新进展（2025–2026 高水平会议）
+
+> 目的：为「代价体 + WAFT 最小注入」找方案支撑（见 §6.3）。仅列双目立体匹配核心方法，
+> 排除 MVS/SLAM/事件等外围。
+
+### 6.1 双目「代价体 + 迭代」新方法
+
+| 论文 | 会议 | 与「代价体+迭代融合」相关的核心思想 |
+|---|---|---|
+| **GREAT-Stereo**（2509.15891） | ICCV 2025 | 三注意力 **SA(空间)+MA(epipolar匹配)+VA(体积)** 把全局上下文注入迭代代价体；RAFT/IGEV 即插即用，SOTA |
+| **PromptStereo**（2603.01650） | CVPR 2026 | **PRU**：用单目深度基础模型 decoder 作迭代细化，structure+motion prompt 注入 |
+| **MLG-Stereo**（2604.20393） | arXiv 2026 | **Local-Global Cost Volume** + Local-Global Guided Recurrent Unit |
+| **DBStereo**（2509.02415） | arXiv 2025 | **4D 代价体解耦**：空间维与视差维分离、纯 2D 卷积聚合（比 3D 更轻） |
+| **IVF-AStereo**（2508.09543） | ICRA 2025 | **两种代价体融合**：concatenation volume + correlation volume 互补 |
+| **MAFNet**（2512.04358） | arXiv 2025 | 代价体**频域分解**（高/低频）+ 频域注意力聚合，仅 2D 卷积 |
+| **S²M²**（2507.13229） | arXiv 2025 | 全局匹配架构，**无代价体滤波、无深度细化栈**，多分辨率 transformer |
+| **LiteMatch**（2606.31636） | arXiv 2026 | **无 3D 代价体稳定化** + CVC-Loss |
+| **LinStereo**（2606.25437） | arXiv 2026 | **Hierarchical Semantic Cost Volumes** + 线性全局注意力 |
+
+### 6.2 光流侧（与「代价体+warp」相关的提炼）
+
+- RAFT（2020）：correlation volume + GRU（迭代相关体检索开山）；
+- SEA-RAFT（2024）：direct 初始回归 + mixture-of-Laplace；
+- Removing Cost Volumes（ICCV 2025）：代价体**训练后可蒸馏移除**；
+- FlowIt（2026）：OT 全局匹配 + 置信度引导；
+- FreeFlow（ECCV 2026）：**去掉所有偏置**（相关体/warp/迭代）的纯前馈 transformer（反事实对照）。
+
+### 6.3 方案思考：代价体 + WAFT 最小注入（回归后）
+
+WAFT 的核心迭代 `net = delta_proj(cat[fmap1, warped_fmap2, net, disp])` 中，
+`warped_fmap2 = disp_warp(fmap2, disp)` 是**当前视差假设下的单点对齐**（隐式单点代价）。
+「代价体注入」= 把这个单点扩展为**局部代价体特征** `cost_feat`。四种由浅入深的候选：
+
+| 候选 | 改动 | 论文支撑 | 侵入度 |
+|---|---|---|---|
+| **A. concat 注入** | `delta_proj(cat[fmap1, warped_fmap2, cost_feat, net, disp])`，cost_feat=窄带相关特征 | RAFT / WAVE | 最小 |
+| **B. 全局上下文注入** | cost_feat 融合 epipolar 全局 + 空间全局注意力 | GREAT-Stereo | 中 |
+| **C. 解耦/频域代价体** | cost_feat 用空间×视差解耦 2D 聚合 或 频域高/低分解 | DBStereo / MAFNet | 中 |
+| **D. 代价体替换 warp** | `delta_proj(cat[fmap1, cost_feat, net, disp])`，去掉 warped | S²M² | 激进 |
+
+**推荐路径**：从 **A（最小 concat 注入）** 起步——只在 `delta_proj` 输入加一个 cost_feat，
+其余（prop bins 初始化 / VitIter / warp / L1 损失）全部保持原始 WAFT；单因子、多种子、可归因。
+若 A 稳健有效，再逐步升 B（全局上下文）/C（解耦频域），并对比 WAVE-Stereo 的 ConvGRU 差异。
