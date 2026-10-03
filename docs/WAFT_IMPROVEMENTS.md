@@ -69,3 +69,25 @@ encoder(stack[img1,img2]) → fmap1, fmap2, net
 - 候选 D：**多尺度代价体**（1/4 代价体 + 1/2 warp，跨尺度互补）。
 
 下一步：调研 CVPR/ICCV/ECCV/NeurIPS 2024–2026 的双目立体匹配与光流估计，验证/修正候选方案。
+
+## 6. 候选 A 实测结果（`step11_cost_injection.py`，80 步 × 3 种子）
+
+| 配置 | EPE mean±std | 逐种子 |
+|---|---|---|
+| WAFT（warp-only） | **4.758 ± 0.460** | 4.125 / 4.943 / 5.205 |
+| WAFT+Cost（窄带相关 concat 注入） | 6.061 ± 2.067 | 3.732 / 5.696 / 8.755 |
+
+**负结果**：窄带相关 `cost_feat` 直接 concat 进 delta_proj **不稳健、甚至有害**（mean 差 −27%，
+std 从 0.46 暴涨到 2.07，即引入严重初始化敏感）。
+
+**根因（关键诊断）**：`warped_fmap2 = disp_warp(fmap2, disp)` 本身已是「当前视差下的单点对齐
+（隐式代价）」，而窄带相关给的也是「当前视差 ±R 的匹配证据」——**两者信息高度冗余、不互补**，
+concat 进去只是给 delta_proj 加了需要学习忽略的噪声。这解释了为何 WAVE-Stereo 有效：它的
+correlation 提供**多候选匹配证据**（与单点 warp 互补），且用专门的分支编码（GWCE）+ ConvGRU，
+而非简单 concat。
+
+**教训**：代价体注入要有效，必须满足「**与 warp 互补**」（信息不冗余）且「**有专门融合机制**」
+（非 concat）。下一步方向：
+- 候选 B：cost_feat 改为 **epipolar 全局相关**（全视差范围，提供 warp 单点没有的全局匹配证据）；
+- 候选 C：cost_feat 提供**不同模态**（频域高/低频 或 空间×视差解耦），与 warp 的光度信息互补；
+- 融合：从 concat 升级为门控/注意力融合（对应此前整体 fusion 有效、单点 concat 无效的观察）。
