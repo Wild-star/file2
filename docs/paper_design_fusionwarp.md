@@ -1,288 +1,154 @@
-# FusionWarp-Stereo：全局匹配、稀疏相关与迭代 warping 的融合立体匹配（论文设计）
+# FusionWarp-Stereo：多源证据与置信引导的迭代双目匹配
 
-> 本文是在 WAFT-Stereo（warping-only、无代价体）之上的**新方法设计**：
-> 保留 warping 的效率优势，针对「低纹理 / 大视差 / 遮挡」和「每轮全量 token 计算」两个短板，
-> 融合近年光流与立体匹配的模块，形成一个可训练、可消融的复合框架。
-> 代码 POC：`step2_fusion_composite.py`（自包含，CPU 可跑通前向+反向+训练）。
+## —— 模块迁移缝合设计文档（v2，聚焦"如何缝合别人的优秀模块"）
 
-## 1. 标题（候选）
-
-**FusionWarp-Stereo: Fusing Global Matching, Sparse Correlation and Iterative Warping for Efficient Stereo Matching**
-
-## 2. 摘要（要点）
-
-现有基于迭代优化的立体匹配（RAFT-Stereo、IGEV-Stereo）依赖代价体；WAFT-Stereo 证明代价体非必需，
-仅靠逐轮 warping 即可达到顶尖精度与速度。然而纯 warping 缺乏显式的全局匹配信号，在低纹理、
-大视差区域收敛慢、易错配；且其迭代 ViT 每轮在所有 token 上全量计算，存在大量冗余。
-
-本文提出 **FusionWarp-Stereo**，在不引入全尺寸代价体的前提下，向 WAFT 注入三类互补模块：
-(1) **GlobalMatcher**（GMFlow/STTR 式全局匹配）在 1/8 粗尺度做交叉注意力 + 全视差范围相关，
-直接回归初始视差并产出全局上下文种子；
-(2) **SparseCorrAnchor**（RAFT-Stereo/GwcNet 式窄带相关）在 disp±R 内做 group-wise 相关，
-以**零初始化**注入迭代更新（手术安全，初始化时等价原版）；
-(3) **TokenSparseViT**（Selective-Stereo 选择性更新思想 + token 稀疏诊断）对迭代解码器的 token
-做 saliency 门控，仅对高信息 token 充分更新。
-三者由 **GatedFusion**（ACVNet 式门控）融合，并用 SEA-RAFT 的 **mixture-of-Laplace** 鲁棒损失训练。
-
-预期效果：全局匹配补足低纹理/大视差，稀疏相关恢复局部纹理细节，token 稀疏降低计算冗余，
-在保持 WAFT 无代价体高效率的同时提升精度与收敛速度。
-
-## 3. 贡献
-
-1. 提出「全局匹配初始视差 + 窄带相关锚 + 迭代 warping」的三源融合范式，**不依赖全尺寸代价体**。
-2. 设计 `GatedFusion` 门控融合：可学习地权衡「全局上下文」与「局部相关锚」两个异构匹配信号。
-3. 将 token 稀疏性（本仓库 P0 诊断的 Δdisp 集中性）落地为 `TokenSparseViT` 的可学习稀疏更新。
-4. 自包含 POC 脚本 `step2_fusion_composite.py`：在 CPU 上完成前向/反向/训练与消融自检，
-   作为论文方法的可复现最小实现。
-
-## 4. 方法
-
-### 4.1 总览
-
-输入左图 I_L、右图 I_R（已校正，RGB）。共享 stride-2 特征编码器得到 context 特征 `f1,f2`（1/2 尺度）；
-独立匹配分支得到匹配友好特征 `m1,m2`（1/2 尺度，Step-1 结论：context 特征非匹配代价，需独立分支）。
-
-```
-d_gm, g_feat = GlobalMatcher(f1, f2)          # 全局初始视差 + 全局上下文
-disp = d_gm
-net  = 0
-for itr in 1..T:
-    disp = detach(disp)
-    anchor = SparseCorrAnchor(m1, m2, disp)   # (2R+1)*G → C，零初始化
-    warped = warp(f2, disp)
-    fused  = GatedFusion(anchor, g_feat)
-    x      = cat[f1, warped, net, disp, fused]
-    net    = delta_proj(x)                    # Conv
-    net, g = TokenSparseViT(net)              # token 级稀疏更新，g=saliency gate
-    Δdisp  = disp_head(net)
-    disp   = disp + Δdisp
-    disp_up = convex_upsample(disp * 2, mask) # 1/2 → 全分辨率
-```
-
-### 4.1.1 与 WAFT-Stereo 基线的结构对比
-
-基线 `algorithms/waft.py::WAFT` 与本方法 `step2_fusion_composite.py::FusionWarpStereo`
-的逐项差异（均保留「迭代 warp + 凸上采样」主干）：
-
-| 维度 | 原始 WAFT-Stereo | 新 FusionWarp-Stereo |
-|---|---|---|
-| 初始视差 | prop 分支：`prop_proj(cat[f1,f2])` → `prop_decoder(VitIter)` → 视差 **bins 软分类 + soft-argmax** | `GlobalMatcher`：1/8 交叉注意力 + **全范围相关 soft-argmax**（直接初始回归） |
-| 匹配信号 | **无**（仅 `warp(f2,disp)` 后的差分） | **显式**：全局相关 + 窄带相关/轻量代价体（`corr`/`gev` 锚） |
-| 迭代更新输入 | `cat[fmap1, warped_fmap2, net, disp]`（2C+hidden+1） | `cat[f1, warped_f2, net, disp, fused]`（4C+1，多一路 `fused`） |
-| 融合机制 | 无（直接 concat） | `GatedFusion`：可学习门控融合「全局上下文 vs 局部锚」 |
-| 迭代解码器 | `VitIter`（timm 预训练 ViT + LoRA + DPT，**全量 token**） | `TokenSparseViT`（**saliency 门控稀疏**，仅高信息 token 充分更新） |
-| 代价体 | 完全无 | 无全尺寸代价体；注入窄带锚（`SparseCorrAnchor` 或 `GEVCostAnchor`） |
-| 凸上采样 | convex upsample（9 邻域，同） | 同（镜像实现） |
-| 逐轮残差 | `disp = disp.detach()`；`disp += Δdisp`（同） | 同 |
-| 骨干 | DAv2 / DINOv3（输出 `fmap1,fmap2,net` 三元组） | 同（真实版应保留）；POC 用自包含小 `FeatureEncoder`+`MatchFeat` 降级 |
-
-**三个结构性新增**（对应 §3 贡献）：
-1. **初始化替换**：`prop bins 分类` → `GlobalMatcher 全局匹配`（补足大视差/低纹理的粗定位）。
-2. **迭代信号增强**：在 `cat[...]` 里新增 `fused` 一路，把「窄带相关/代价体锚」与「全局上下文」门控后注入（补足局部纹理/遮挡）。
-3. **解码器稀疏化**：`VitIter 全量 token` → `TokenSparseViT 稀疏 token`（降低每轮冗余计算）。
-
-**保持不变**：`disp.detach()` 逐轮停止梯度、`disp_warp` 沿 `-disp` 对齐、`convex_upsample`、
-以及「多轮预测 + 指数加权监督」的整体范式——这正是 WAFT 无代价体高效性的来源。
-
-### 4.2 GlobalMatcher（GMFlow / STTR / SEA-RAFT）
-
-- 将 `f1,f2` 池化到 1/8，展平成 token 并加可学习位置编码；
-- 左↔右 **交叉注意力**（1 层）增强特征，缓解低纹理/遮挡歧义；
-- 对增强后的特征做**全视差范围相关 + softmax**：`C(x,d)=⟨Ĩ_L(x), Ĩ_R(x-d)⟩`，`d_gm=Σ_d d·softmax(C)`；
-- `d_gm` 上采样回 1/2 作为初始视差（**直接初始回归**，同 SEA-RAFT），
-  并与 1/2 尺度 GT 做辅助监督；
-- 增强特征经投影得到全局上下文 `g_feat`，作为迭代隐状态种子。
-
-### 4.3 SparseCorrAnchor（RAFT-Stereo / GwcNet / CREStereo）
-
-- 在当前视差 `disp` 的窄带 `±R` 内（1/2 尺度），对匹配特征做 **group-wise 相关**：
-  通道分 G 组，组内归一化点积，得 `(2R+1)·G` 通道代价；
-- 经 **零初始化 1×1/3×3 卷积**聚合成 C 通道锚特征 → 注入迭代。零初始化保证「加载预训练 WAFT 后行为等价原版」。
-
-### 4.4 GatedFusion（ACVNet / CREStereo）
-
-- 门控：`g = σ(Conv([anchor, g_feat]))`，`fused = g·anchor + (1-g)·g_feat`；
-- 空间自适应地在「局部相关锚」与「全局上下文」之间选择可信信号。
-
-### 4.5 TokenSparseViT（Selective-Stereo + P0 诊断）
-
-- ViT patch 化后，router 预测每个 token 的 saliency，`gate = σ(sal)`；
-- 稀疏更新：`h' = tok + gate ⊙ (Attn(tok) - tok)`。gate→0 的 token 原样保留（硬 top-k 版本可跳过注意力省算力）；
-- 训练损失附加 `λ·mean(gate)` 鼓励稀疏；脚本统计并打印实际稀疏度。
-
-### 4.6 损失（SEA-RAFT）
-
-混合拉普拉斯负对数似然（对离群点鲁棒）：
-
-```
-L_ml(e) = -log( π·(1/2b0)exp(-|e|/b0) + (1-π)·(1/2b1)exp(-|e|/b1) )
-L = λ_init·L_ml(d_gm - gt_half) + Σ_i 0.5^(T-1-i)·L_ml(disp_i - gt) + λ_s·mean(gate)
-```
-
-## 5. 消融设计（论文实验）
-
-| 消融 | 预期 |
-|---|---|
-| 去掉 GlobalMatcher（随机初始视差） | 大视差/低纹理 EPE 上升、收敛变慢 |
-| 去掉 SparseCorrAnchor（use_anchor=False） | 局部纹理细节变差，边缘 blur |
-| **SparseCorrAnchor vs GEVCostAnchor（corr vs gev）** | 后者带 3D 正则化，无纹理/歧义区更稳 |
-| **GEV full3d vs sep3d** | sep3d 精度≈持平、参数量/算力更低 |
-| 去掉 GatedFusion（改为直接 concat/add） | 融合失衡，精度小幅下降 |
-| 去掉 TokenSparseViT（gate≡1） | 精度≈持平，计算量上升（稀疏度归零） |
-| L1 vs MixtureLaplace | 后者在离群/遮挡处更稳 |
-
-### 5.1 POC 实测（`step3_ablation.py`，120 步，同数据/种子/公平初始化）
-
-> 公平初始化：锚模块最后构造，保证共享模块在 corr/gev 之间得到一致随机种子；
-> gev 对齐到 corr 的尺度(1/2)与带宽(R=4)，且去掉 d_cv 辅助项（只比较锚本身的贡献）。
-
-| 配置 | 参数量 | EPE末(px) | bad1px | 相对 no_anchor |
-|---|---|---|---|---|
-| no_anchor（纯 warp 基线） | 269.6K | 2.430 | 70.5% | — |
-| **corr**（稀疏相关锚，无聚合） | 269.6K | **1.850** | 63.2% | **+23.9%** |
-| gev-full3d@1/2（完整 3D 聚合） | 254.0K | 2.092 | 67.4% | +13.9% |
-| gev-sep3d@1/2（可分离 3D） | 252.5K | 1.937 | 64.4% | +20.3% |
-
-**结论**：① 任何锚都显著优于纯 warp（+14~24%），验证「注入匹配证据」的普适价值；
-② 稀疏相关锚（无聚合）在本尺度最优，与 WAFT「代价体非必需」的主张一致；
-③ 在代价体锚内部，**可分离 3D（sep3d）优于完整 3D（full3d）**（精度更高、参数更少、更快），
-说明轻量正则化优于重聚合。这是一个可直接写入论文的消融结论。
-
-## 6. 实验计划（全量训练时）
-
-- 数据：SceneFlow / CREStereo / TartanAir / FSD 等合成集（复用 WAFT 配置），ETH3D/KITTI/Middlebury 评测。
-- 基线：WAFT-Stereo（DAv2S-4 等）、RAFT-Stereo、IGEV-Stereo、Selective-Stereo。
-- 指标：EPE、bad-1px/3px、运行时间、FLOPs；零样本跨域（sim-to-real）。
-- 收敛性：对比带/不带 d_gm 初始化的收敛曲线（预期收敛更快）。
-
-## 7. 与现有工作（本仓库 step1）的关系
-
-- `step1_fusion.py`：仅注入窄带代价体锚（MatchingBranch + AnchorHead），零初始化，验证「需训练匹配信号」。
-- 本文 `step2_fusion_composite.py`：在 step1 之上**新增** GlobalMatcher、GatedFusion、TokenSparseViT 与
-  mixture-of-Laplace 损失，形成完整的「三源融合 + 稀疏迭代」论文方案（自包含，CPU 跑通）。
-
-## 8. 如何引用传统代价体（设计深化）
-
-### 8.1 传统代价体的两个本质价值
-
-传统代价体（PSMNet / GwcNet / ACVNet / IGEV）之所以有效，靠的是两个正交的能力：
-
-1. **显式匹配证据**：把「左特征 × 右特征」在**所有候选视差**上的相似度显式写成张量
-   `V(x,d)=⟨f_L(x), f_R(x-d)⟩`（correlation / concat / group-wise），网络可直接"读到"匹配强度分布。
-2. **可学习正则化聚合**：用 3D CNN / hourglass 在「视差维 × 空间维」做邻域平滑与代价滤波，
-   这是代价体方法对**无纹理 / 歧义区域**鲁棒的关键。
-
-WAFT 丢弃代价体后丢掉的正是这两点：warping 只提供「当前视差处」的局部证据，既没有全范围匹配分布，
-也没有跨视差邻域的显式正则化 → 低纹理 / 大视差 / 遮挡处收敛慢、易错配。
-**因此"引用传统代价体"的合理目标，不是回到全尺寸代价体，而是把这两大价值以「可控成本」补回来。**
-
-### 8.2 三种引用深度（由轻到重）
-
-| 方案 | 内容 | 代价体两大价值 | 效率 |
-|---|---|---|---|
-| A 轻：相关分布 + soft-argmax（无聚合） | 现 GlobalMatcher 全范围相关 + SparseCorrAnchor 窄带相关 | 只有①，缺② | 最高 |
-| **B 中（推荐）：窄带几何编码体 + 轻量 3D 聚合** | `GEVCostAnchor` | ① + ② 都在 | 高 |
-| C 重：全分辨率全视差 3D hourglass 主分支 | PSMNet/IGEV 式，warp 退化为 refine | ① + ② 最强 | 低，背离 WAFT 初衷 |
-
-推荐 **B**：它把代价体的两大价值都引回来，但通过「1/4 尺度 + 窄带 + 组相关 + 少层小通道 3D 卷积」把成本压到可控。
-
-### 8.3 GEVCostAnchor 设计（脚本 `ANCHOR_KIND=gev`）
-
-- **构造**（1/4 尺度，当前视差附近）：`V = concat[ group-wise 相关(匹配证据), 当前视差(几何信息) ]`
-  → 得到「组合几何编码体」（IGEV 精神：匹配 + 几何 + 上下文同体）。
-- **采样**：窄带 `±R` 内**非均匀采样 K 个候选**（中心密、边缘疏，Selective-Stereo 稀疏采样思想），
-  避免全视差范围。
-- **聚合**：2 层轻量 3D 卷积在「视差维 × 空间维」聚合 → `agg`；支持两种实现（`agg_kind`）：
-  - `full3d`：完整 `(3,3,3)` 卷积；
-  - `sep3d`：**可分离 3D** —— 空间 2D `(1,3,3)` + 视差维 1D `(3,1,1)` 分离（PSMNet/GA-Net 轻量化思想，参数量/算力更低）；
-  `cost=3DConv(agg)` → `prob=softmax_k(cost)`。
-- **输出**：
-  - `d_cv = Σ_k prob·d_k`：代价体先验视差（可直接监督，加速收敛）；
-  - `feat = Σ_k prob·agg`：概率加权的代价体上下文特征，作为锚经 GatedFusion 注入迭代。
-- **监督**：`L_cv = λ·L_ml(d_cv - gt_half)`，与 `d_gm`、各轮 `disp` 联合训练。
-
-### 8.4 与 SparseCorrAnchor 的定位关系（同一插槽、可切换）
-
-- `SparseCorrAnchor` = **无聚合的逐点相关**（局部匹配证据，零初始化、手术安全）；
-- `GEVCostAnchor` = **带 3D 正则化聚合的窄带代价体**（匹配证据 + 上下文正则化）。
-
-两者占用同一插槽（`anchor_kind='corr' | 'gev'`），消融可单独回答「**3D 聚合是否带来增益**」这一核心问题。
-
-### 8.5 为何不破坏效率
-
-- 代价体只在 **1/4 尺度**（默认，`gev_downsample=2`）或 **1/2 尺度**（`gev_downsample=1`）构造；
-- 窄带 `K=9` + 组相关 `G=4`，非全视差范围；
-- 3D 卷积仅 2 层、通道 `Cv=8`，且支持**可分离 3D**（`agg_kind='sep3d'`）进一步降参数/算力；
-- 结果上采样回 1/2 后作为「锚」注入，不替代 warp 主干；
-- 输出零初始化（`feat=0`、`d_cv=disp_q`）→ 手术安全，等价原版。
-
-POC 实测（CPU）：`step3_ablation.py` 120 步公平对比中，gev 锚相对纯 warp 基线带来
-+13.9%（full3d）/ +20.3%（sep3d）的 EPE 降幅，且 sep3d 精度更高、参数更少、更快（见 §5.1）。
+> 本设计的主旨不是"我发明了哪些新模块"，而是回答：**在 WAFT 式纯 warp 迭代框架上，
+> 如何把成熟文献中经过充分训练验证的优秀机制，按一条主线迁移、缝合，形成一个有机整体**。
+> 每个模块都标注来源、迁移的机制、缝合位置、解决的短板。深度模块的有效性须经充分训练
+> 验证，本设计不依赖任何短训练 POC 指标下结论。
 
 ---
 
-## 9. 原创性与 prior work 声明（诚实对照 · 2026-09 修订）
+## 0. 设计定位（一句话）
 
-> 本节是**学术诚信声明**，投稿前必须保留。2026-09 修订：在读到 WAVE-Stereo 完整方法
-> （arXiv:2607.13674 全文 §3）后，将原「核心 novelty 撞车」的结论修正为
-> 「**动机撞车、实现象限正交**」，并给出三个可证伪的差异化主张（§9.3）。
+WAFT-Stereo 证明了「纯 feature-warping、无代价体」的可行性，但其信息流只有**单点 warp 对齐**
+一路；本设计把它升级为「**多源匹配证据 + 置信引导的迭代匹配**」：每路证据、每个引导机制
+都从成熟文献迁移而来，缝合在 WAFT 的迭代主干的明确位置上。
 
-### 9.1 核心事实（修订）
+## 1. 设计哲学：一条主线、三类短板、八个迁移模块
 
-本设计的核心动机——「相关（matching search）与 warp 残差（residual alignment）是
-互补的对应表示，应统一注入迭代更新器」——与 **WAVE-Stereo**（arXiv:2607.13674，
-2026-07-15，Zehan Liu et al.）**动机一致**。WAVE-Stereo 明确把 WAFT-Stereo 定位为
-「只用 warp、丢弃匹配候选信息」的 paradigm split 之一端，提出 GWCE（GeoWarp
-Correspondence Encoder）+ PGCP（Periodic Global Context Propagation）统一两种表示。
+主线：**证据 → 置信 → 效率**（Evidence → Confidence → Efficiency）。
 
-**但两者落在正交的实现象限**（见 §9.2）：WAVE 走「轻量无 VFM + ConvGRU 局部迭代 +
-周期补全局 + 带聚合的几何编码体积」；本设计走「VFM 先验 + ViT 原生全局迭代 +
-无聚合逐点相关锚」。因此动机撞车，但**不是「已被抢先发表的同一方案」**，而是同一
-动机在两个架构象限的独立实现——差异化空间存在，但必须以**可证伪的实验命题**
-（而非「首次统一相关与 warp」的原创主张）来支撑。
+- **证据流（Evidence）**：WAFT 只有单点 warp，缺「多候选匹配证据」与「全局定位」；
+- **置信流（Confidence）**：有了多源证据，需学习「信谁、在哪里信」；
+- **效率流（Efficiency）**：证据与置信带来额外算力，需「选择性投入」保持 WAFT 的高效。
 
-### 9.2 与 WAVE-Stereo 的逐点对照（基于其完整方法 §3，2026-09 修订）
+三类短板、八个模块全部从已发表文献迁移（无一是本设计原创），缝合逻辑见下表。
 
-| 维度 | WAVE-Stereo | FusionWarp-Stereo（本设计） | 关系 |
-|---|---|---|---|
-| 骨干 | MobileNetV2 + FPN，**无 VFM** | **DAv2/DINOv3 VFM 先验**（冻结 + LoRA） | 正交 |
-| 分辨率 | 1/4（Cf=24） | 1/2（48ch，VFM 输出） | 不同 |
-| 初始视差 | all-pairs 相关 + **2D 聚合** + soft-argmin | GlobalMatcher 交叉注意力 + 全范围相关 soft-argmax（**无聚合**） | 相近，聚合策略相反 |
-| 匹配证据 | **几何编码体积**（IGEV 式，带 2D/3D 聚合） | **无聚合逐点相关锚**（SparseCorrAnchor） | **对抗** |
-| warp 分支 | Warp(fR,d) + 卷积编码 | disp_warp(f2,disp) + concat | 相同（继承 RAFT/WAFT） |
-| 迭代单元 | **ConvGRU**（局部 RNN，训练 12 / 推理 8 轮） | **ViT**（原生全局注意力，WAFT 式 3 轮） | 正交 |
-| 全局上下文 | **PGCP**：每 K 轮 8× 池化到 1/32 → 3 层 ViT(dim=128)+DPT → 注入 GRU 隐态（α=-0.1） | **无需 PGCP**（ViT 每轮原生全局注意力） | **对抗** |
-| 融合 | concat + Fusion 卷积 | 零初始化加到 delta_proj 输出（手术安全） | 不同 |
-| 损失 | SmoothL1(初始) + L1(迭代 γ=0.9) | mixlap（混合拉普拉斯）+ init KL | 不同 |
-| 精度 / 速度 | 66ms / 980MB / ETH3D 0.86 BP-2 | 601ms / 10GB / ETH3D 0.32 BP-2 | 互补象限 |
+## 2. 模块迁移缝合总表（核心）
 
-**关键纠正**：初版 §9 把「匹配检索」「全局上下文」判为「相近/方向相近」，是未读到
-WAVE 具体实现时的误判。实际二者在这两个维度上是**对抗的**：WAVE 用带聚合的几何
-编码体积，而本设计 step3 实测「无聚合相关 > 3D 聚合」；WAVE 因 ConvGRU 局部而被迫
-引入 PGCP 补全局，而本设计 ViT 原生全局、无需补丁。
+| # | 模块 | 迁移来源（谁·机制） | 缝合位置 | 解决的短板 | 主线 |
+|---|---|---|---|---|---|
+| A1 | GlobalMatcher | GMFlow (2021) / SEA-RAFT (2024)：全局匹配 + 直接初始回归 | 替代 WAFT 的 `prop_bins` 分类初始化 | 粗定位（大视差/低纹理） | 证据 |
+| A2 | CostAnchor | RAFT-Stereo (2021) / IGEV (2023)：窄带相关/几何代价体 | 迭代内、与 `warp(f2,disp)` 并列 | 多候选匹配证据（单点 warp 缺失） | 证据 |
+| A3 | 解耦代价体聚合 | DBStereo (2025)：4D 代价体空间×视差 2D 解耦 | A2 的聚合层 | 代价体效率（无 3D 卷积） | 证据 |
+| B1 | GatedFusion | ACVNet (2022) / CREStereo (2022)：空间门控融合 | A2 锚与全局上下文之间 | 局部 vs 全局证据权衡 | 置信 |
+| B2 | Uncertainty | U²Flow (2026) / URS-Stereo (2026)：逐像素 aleatoric 不确定性 | 迭代隐状态上的 σ 头，复用三处 | 难例自适应（遮挡/无纹理） | 置信 |
+| B3 | GlobalContext | GREAT-Stereo (ICCV 2025)：SA(空间)+MA(epipolar)+VA(体积) 注意力 | 迭代内、全局上下文注入 | 无纹理/重复纹理歧义 | 置信 |
+| C1 | TokenSparseViT | Selective-Stereo (2024) / DynamicViT：token 级选择性更新 | 替代 WAFT 的 `VitIter` 全量 token | 迭代算力冗余 | 效率 |
+| C2 | 代价体训练蒸馏 | Removing Cost Volumes (ICCV 2025)：代价体训练后移除 | A2 的训练/推理分离 | 推理代价体冗余 | 效率 |
 
-### 9.3 三个可证伪的差异化主张（升级自原「实现细节级」评估）
+## 3. 逐模块迁移设计
 
-1. **【最硬】无聚合相关 > 几何编码体积聚合**。step3 实测（96×128 POC，120 步，
-   公平初始化）：corr 无聚合 +23.9%，gev-full3d 带聚合 +13.9%，gev-sep3d +20.3%。
-   若全量训练复现，即直接反驳 WAVE 的几何编码体积（IGEV 式聚合）设计。
-2. **【架构命题】ViT 原生全局 vs ConvGRU + 周期 PGCP**。WAVE 被迫用 PGCP 补全局；
-   本设计证明 ViT 迭代器自带全局、无需额外模块。可消融回答「每轮全局注意力 vs
-   周期性全局注入」孰优。
-3. **【象限补位】VFM 先验 + 最小匹配分支**。WAVE 明确无 VFM；本设计在 VFM 特征上
-   用 34K 参数匹配分支把「GT 对齐 argmax 命中率」从 46% 提到 87%（step1）。
-   「如何让 VFM 通用特征廉价变匹配友好」是 WAVE 无法回答、本设计能回答的问题。
+> 统一模板：来源 → 解决的短板 → 缝合位置 → 设计细节 → 协同关系。
 
-### 9.4 论文重新定位（修订）
+### 3.1 证据流（Evidence）
 
-1. **【推荐】跨象限系统研究 / 对抗性消融**：不以「首次统一相关与 warp」为原创，
-   明确以 WAVE-Stereo 为 prior work，聚焦三个可证伪命题（§9.3），回答「相关+warp
-   融合从轻量 ConvGRU 象限搬到 VFM+ViT 象限后，匹配证据应以无聚合形式注入、且 ViT
-   原生全局使 PGCP 冗余」。
-2. **【降级】复现 + 验证**：WAFT / WAVE 的复现与工程实现，不做投稿。
-3. **【高风险】另寻实质差异**：不建议，除非全量训练后出现意料之外的强结果。
+#### A1 GlobalMatcher —— 全局匹配初始化
+- **来源**：GMFlow 的「transformer 全局匹配」+ SEA-RAFT 的「direct 初始回归」。
+- **短板**：WAFT 的 `prop_bins` 在局部感受野内做 bins 软分类，缺乏全局定位，大视差/低纹理下易错。
+- **缝合**：替换 `prop_proj/prop_decoder/prop_bins_head` 为「1/8 池化 → 左右交叉注意力 → 全范围相关
+  `C(x,d)=⟨l(x), r(x-d)⟩` → soft-argmax 得 `d_gm`」；`d_gm` 作为初始视差，交叉注意力特征投影为全局上下文 `g_feat`。
+- **协同**：`g_feat` 同时喂给 B1（门控）与 B3（全局上下文），是「置信流」的输入之一。
 
-**决定：本设计以「WAVE-Stereo 的跨象限差异化 / 对抗性消融」定位推进；所有文档与
-代码必须显式引用 WAVE-Stereo 作为 prior work，并保留 §9.3 的三个可证伪命题作为
-投稿时的贡献主张边界。**
+#### A2 CostAnchor —— 窄带代价体锚
+- **来源**：RAFT-Stereo 的「迭代相关体检索」+ IGEV 的「几何编码体」。
+- **短板**：`warped_fmap2 = warp(f2, disp)` 只是**当前视差下的单点对齐**，无多候选匹配证据（候选 A 实测
+  亦证明：窄带相关若与 warp 简单 concat 则冗余，须作为**独立锚 + 门控**注入，见 B1）。
+- **缝合**：在独立匹配特征 `m1,m2` 上，于当前 `disp` 的 `±R` 窄带做 group-wise 相关，经**零初始化**投影
+  得锚特征 `anchor`（零初始化保证加载预训练 WAFT 后行为等价原版）。
+- **协同**：`anchor` 不直接 concat 进 `delta_proj`，而是先经 B1 门控与全局上下文融合——这是与
+  「候选 A 失败」的关键区别。
 
+#### A3 解耦代价体聚合 —— 空间×视差 2D 解耦
+- **来源**：DBStereo 的「4D 代价体解耦为空间维 + 视差维，纯 2D 卷积聚合」。
+- **短板**：代价体 3D 卷积是效率瓶颈，与 WAFT 轻量定位矛盾。
+- **缝合**：A2 的窄带代价体聚合用「空间 2D 卷积（spatial）+ 视差方向 1D 卷积（disparity）」解耦，
+  替换 3D 正则化，保持轻量。
+- **协同**：与 C2（训练蒸馏）一起构成「代价体只在训练时充分、推理时廉价」的完整效率设计。
+
+### 3.2 置信流（Confidence）
+
+#### B1 GatedFusion —— 空间门控融合
+- **来源**：ACVNet 的 attention gate / CREStereo 的融合门控。
+- **短板**：局部锚（纹理处可靠）与全局上下文（无纹理处可靠）的可靠域互补，需**空间自适应**选择。
+- **缝合**：`g = σ(Conv([anchor, g_feat]))`，`fused = g·anchor + (1-g)·g_feat`，`fused` 作为额外一路
+  注入 `delta_proj` 输入。
+- **协同**：是「候选 A 简单 concat 失败」的修正——从「无选择拼接」升级为「可学习门控选择」。
+
+#### B2 Uncertainty —— 逐像素不确定性引导
+- **来源**：U²Flow 的「联合估计 flow + aleatoric 不确定性」+ URS-Stereo 的「不确定性引导残差搜索」。
+- **短板**：遮挡/无纹理是难例，固定损失/固定搜索半径无法自适应。
+- **缝合**：迭代隐状态上加 `σ = softplus(conv(net))`，复用三处：
+  ① 调制 B1 门控（低置信处更偏向全局上下文）；② 自适应 A2 窄带搜索半径 `R`；③ 损失权重（难例降权）。
+- **协同**：是「置信流」的**统一来源**——σ 同时服务 B1、A2、损失，而非独立堆砌。
+
+#### B3 GlobalContext —— 全局上下文注意力
+- **来源**：GREAT-Stereo 的 SA（空间）+ MA（epipolar 匹配）+ VA（体积）三注意力，即插即用注入迭代。
+- **短板**：WAFT 迭代无全局上下文传播，无纹理/重复纹理区域无法从远处可靠区「借用」信息。
+- **缝合**：在迭代内对隐状态做 epipolar 方向（沿极线）+ 空间方向的轻量注意力，得到全局上下文，
+  与 A1 的 `g_feat` 合并后供 B1 门控。
+- **协同**：与 B1/B2 构成完整的「全局上下文 → 门控选择 → 难例自适应」置信链。
+
+### 3.3 效率流（Efficiency）
+
+#### C1 TokenSparseViT —— token 级选择性更新
+- **来源**：Selective-Stereo 的选择性更新 + DynamicViT 的 token 剪枝。
+- **短板**：WAFT 的 `VitIter` 对全量 token 做注意力，但逐轮视差增量高度稀疏（本仓库 P0 诊断）。
+- **缝合**：patch 化后 router 预测 saliency，`gate = σ(sal)`，`h' = tok + gate⊙(Attn(tok)-tok)`；
+  训练加 `λ·mean(gate)` 鼓励稀疏，硬 top-k 版本推理跳过低 saliency token 的注意力。
+- **协同**：稀疏性可由 B2 的 σ 调制（低置信 token 才充分更新），与「置信流」耦合。
+
+#### C2 代价体训练蒸馏 —— 训练充分、推理移除
+- **来源**：Removing Cost Volumes（ICCV 2025）的「代价体训练后重要性下降、可蒸馏移除」。
+- **短板**：A2 代价体在推理时仍有开销，而实验表明代价体在训练充分后趋于冗余。
+- **缝合**：A2 在**训练**时作为完整锚 + 辅助监督（`d_cv`），训练后期用蒸馏/剪枝使网络学会
+  「不依赖代价体也能预测」，**推理**时移除 A2 分支。
+- **协同**：与 A3（轻量聚合）共同保证「代价体不破坏 WAFT 高效」。
+
+## 4. 模块协同逻辑（为什么不是堆砌）
+
+八个模块沿三条主线形成**三条闭环**，而非并列：
+
+1. **证据闭环**：A1 全局初始 → A2/A3 局部代价体 → 两者经 B1 门控融合成「多尺度证据」；
+2. **置信闭环**：B3 全局上下文 + B2 逐像素 σ → 共同调制 B1 门控与 A2 搜索半径；
+3. **效率闭环**：C1 稀疏（按 B2 置信度选择 token）+ C2 蒸馏（按训练进度移除代价体）。
+
+**一个统一的迭代更新**（缝合后的完整前向）：
+
+```
+d_gm, g_feat = A1_GlobalMatcher(f1, f2)        # 全局初始 + 全局上下文
+disp = d_gm ; net = 0
+for itr in 1..T:
+    disp     = detach(disp)
+    anchor   = A2_CostAnchor(m1, m2, disp)      # 窄带代价体，A3 解耦聚合
+    g_ctx    = B3_GlobalContext(net, disp)      # epipolar/空间全局注意力
+    fused    = B1_GatedFusion(anchor, g_feat+g_ctx)   # 门控选择局部 vs 全局
+    σ        = B2_sigma_head(net)               # 逐像素不确定性
+    warped   = warp(f2, disp)
+    x        = cat[f1, warped, fused, net, disp]
+    net      = delta_proj(x)
+    net, gate= C1_TokenSparseViT(net, conf=σ)   # 置信调制的稀疏更新
+    Δdisp    = disp_head(net)
+    disp     = disp + Δdisp
+    disp_up  = convex_upsample(disp*2, mask)
+# 推理时：C2 移除 A2 分支，仅保留 warp + 全局上下文
+```
+
+## 5. 训练协议（充分训练，杜绝短 POC 判定）
+
+- **数据**：SceneFlow（FlyingThings3D 主训）+ 多域（KITTI/Middlebury/ETH3D/Booster）零样本评测；
+- **充分收敛**：完整 epoch、学习率 warmup + cosine 衰减、与基线同协议对比；
+- **统计严谨**：≥3 种子报告 mean±std + 配对 t 检验（本仓库已建立 `step8/step9` 多种子协议）；
+- **消融**：每个模块**单因子**消融（其余保持基线），而非一次性堆叠；
+- **明确不做**：以 80 步合成数据 EPE 判定模块有效/无效（这是无效证据，已废止）。
+
+## 6. 创新性说明（诚实：迁移缝合 + 差异化主张）
+
+- **本设计不主张任何单个模块的原创**：A1~C2 均来自已发表文献（见 §2 来源列）。
+- **主张的是「缝合」本身**：在 WAFT 式纯 warp 迭代主干上，把「证据-置信-效率」三线闭环缝合成
+  一个可训练、可消融的整体，并回答每个模块**在哪、为何、如何**接入。
+- **与 WAVE-Stereo（prior work，arXiv:2607.13674）的差异化**：WAVE 用 ConvGRU + GWCE 三分支 +
+  PGCP；本设计用 **ViT 迭代（C1）+ 门控选择（B1）+ 不确定性引导（B2）+ 代价体蒸馏（C2）** 四点为差异，
+  需在全量训练下逐点对照验证（对照方案见 `docs/COMPARISON_PLAN.md`）。
+- **定位**：WAVE-Stereo 的**差异化变体 / 消融研究**，而非独立新范式。
