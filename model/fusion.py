@@ -281,3 +281,75 @@ class GatedFusion(nn.Module):
         g = torch.sigmoid(self.gate(torch.cat([anchor, g_feat], dim=1)))
         fused = g * anchor + (1 - g) * g_feat
         return fused * self.out_scale
+
+
+# --------------------------------------------------------------------------- #
+# D. GWCEFusion —— 补充式 GWCE 三路并行编码旁路（学习 WAVE GWCE + PCW warping volume）
+# --------------------------------------------------------------------------- #
+class GWCEFusion(nn.Module):
+    """在 WAFT 原始 delta 迭代之外，新增的「补充式」三路并行编码旁路。
+
+    学习 WAVE-Stereo 的 GWCE（三路独立编码 + Fusion）与 PCW-Net 的 warping volume
+    （用当前视差把相关检索范围缩小到窄带）。三路互补线索：
+      ① correlation    ：1/4 尺度窄带相关（disp±R）→ 1×1 + 3×3 → 上采样到 1/2
+      ② warp 对齐      ：cat[fmap1, warped_fmap2] → 两个 3×3（跨视角对齐残差）
+      ③ disparity prior：disp → 7×7 大核 + 3×3（当前几何状态的空间分布）
+    三路 concat 后经零初始化 1×1 卷积 Fusion 到隐维度 → 作为残差加到 net。
+
+    「补充而非替换」：WAFT 的 delta_proj/delta_decoder 完全不动，本模块输出仅作残差。
+    Fusion 零初始化 → 输出初始恒 0，加载预训练 WAFT 后行为等价原版（手术安全），
+    消融干净（关某分支 → 少一路 concat，Fusion 输入通道相应减少，仍零初始化）。
+    """
+
+    def __init__(self, C_match, C_enc, hidden, G=8, R=4, disp_kernel=7, fuse_ch=32,
+                 use_corr=True, use_warp=True, use_disp_prior=True):
+        super().__init__()
+        assert any([use_corr, use_warp, use_disp_prior]), "GWCE 至少开一路分支"
+        self.use_corr = use_corr
+        self.use_warp = use_warp
+        self.use_disp_prior = use_disp_prior
+        self.G, self.R = G, R
+
+        # ① correlation 分支（学 WAVE correlation branch：1×1 压缩 + 3×3 空间上下文）
+        if use_corr:
+            assert C_match % G == 0, f"匹配通道 {C_match} 必须能被分组数 {G} 整除"
+            self.enc_c = nn.Sequential(
+                nn.Conv2d((2 * R + 1) * G, fuse_ch, 1), nn.ReLU(inplace=True),
+                nn.Conv2d(fuse_ch, fuse_ch, 3, padding=1))
+
+        # ② warp 对齐分支（学 WAVE cross-view warping branch：两个 3×3）
+        if use_warp:
+            self.enc_w = nn.Sequential(
+                nn.Conv2d(2 * C_enc, fuse_ch, 3, padding=1), nn.ReLU(inplace=True),
+                nn.Conv2d(fuse_ch, fuse_ch, 3, padding=1))
+
+        # ③ disparity prior 分支（学 WAVE disparity prior branch：7×7 大核 + 3×3）
+        if use_disp_prior:
+            self.enc_d = nn.Sequential(
+                nn.Conv2d(1, fuse_ch, disp_kernel, padding=disp_kernel // 2), nn.ReLU(inplace=True),
+                nn.Conv2d(fuse_ch, fuse_ch, 3, padding=1))
+
+        # Fusion：三路 concat → 隐维度，零初始化 → 输出 0（手术安全）
+        n_branches = int(use_corr) + int(use_warp) + int(use_disp_prior)
+        self.fusion = nn.Conv2d(n_branches * fuse_ch, hidden, 1)
+        nn.init.zeros_(self.fusion.weight)
+        nn.init.zeros_(self.fusion.bias)
+
+    def forward(self, m1, m2, fmap1, warped_fmap2, disp):
+        """m1/m2: (B, C_match, H/4, W/4) 匹配特征；fmap1/warped_fmap2: (B, C_enc, H/2, W/2)；
+        disp: (B, 1, H/2, W/2) 当前视差。返回 (B, hidden, H/2, W/2) 残差特征（初始 0）。"""
+        parts = []
+        if self.use_corr:
+            # 1/2 → 1/4 视差（像素单位 ×0.5），窄带相关（PCW warping volume）
+            disp_q = F.interpolate(disp, scale_factor=0.5, mode='bilinear', align_corners=True) * 0.5
+            corrs = [group_corr(m1, disp_warp(m2, disp_q + o, padding_mode='zeros'), self.G)
+                     for o in range(-self.R, self.R + 1)]
+            cost = torch.cat(corrs, dim=1)                       # (B, (2R+1)*G, H/4, W/4)
+            x_c = self.enc_c(cost)                               # (B, fuse_ch, H/4, W/4)
+            x_c = F.interpolate(x_c, size=fmap1.shape[-2:], mode='bilinear', align_corners=True)
+            parts.append(x_c)
+        if self.use_warp:
+            parts.append(self.enc_w(torch.cat([fmap1, warped_fmap2], dim=1)))
+        if self.use_disp_prior:
+            parts.append(self.enc_d(disp))
+        return self.fusion(torch.cat(parts, dim=1))              # (B, hidden, H/2, W/2)

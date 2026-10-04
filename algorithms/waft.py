@@ -10,7 +10,7 @@ from einops import rearrange
 from model.iterative import fetch_iterative_module
 from model.encoder import fetch_feature_encoder
 from model.utils import Padder, disp_warp, gaussian_weights
-from model.fusion import MatchingBranch, SparseCorrAnchor, GEVCostAnchor, GlobalMatcher, GatedFusion
+from model.fusion import MatchingBranch, SparseCorrAnchor, GEVCostAnchor, GlobalMatcher, GatedFusion, GWCEFusion
 
 def freeze_module(module):
     for p in module.parameters():
@@ -53,6 +53,14 @@ class WAFT(nn.Module):
         self.use_anchor = self.fusion_enabled and (bool(fusion_cfg.USE_ANCHOR) or self.use_gated_fusion)
         self.anchor_kind = getattr(fusion_cfg, 'ANCHOR_KIND', 'corr') if fusion_cfg is not None else 'corr'
 
+        # GWCE 补充式旁路（v3）：学习 WAVE GWCE + PCW，取代旧替换式三件套
+        # （开 GWCE 时强制关闭 use_anchor/use_global_init/use_gated_fusion，避免重复注入）
+        self.use_gwce = self.fusion_enabled and bool(getattr(fusion_cfg, 'GWCE_ENABLED', False))
+        if self.use_gwce:
+            self.use_global_init = False
+            self.use_gated_fusion = False
+            self.use_anchor = False
+
         if self.use_anchor:
             mch = fusion_cfg.MATCH_CH
             self.matching_branch = MatchingBranch(ch=mch, out_ch=mch)
@@ -75,6 +83,18 @@ class WAFT(nn.Module):
 
         if self.use_gated_fusion:
             self.gated_fusion = GatedFusion(C=self.hidden_dim)
+
+        # GWCE 补充式旁路构建（v3）：MatchingBranch + 三路并行编码 + 零初始化 Fusion
+        if self.use_gwce:
+            mch = fusion_cfg.MATCH_CH
+            self.matching_branch = MatchingBranch(ch=mch, out_ch=mch)
+            self.gwce = GWCEFusion(
+                C_match=mch, C_enc=self.enc_dim, hidden=self.hidden_dim,
+                G=fusion_cfg.CORR_GROUPS, R=fusion_cfg.CORR_RADIUS,
+                disp_kernel=fusion_cfg.DISP_PRIOR_KERNEL, fuse_ch=fusion_cfg.FUSION_CH,
+                use_corr=bool(getattr(fusion_cfg, 'GWCE_CORR', True)),
+                use_warp=bool(getattr(fusion_cfg, 'GWCE_WARP', True)),
+                use_disp_prior=bool(getattr(fusion_cfg, 'GWCE_DISP_PRIOR', True)))
 
         # 升级1（DPI）：深度 → 视差 warm start 头（零初始化 → 初始等价原版）
         if self.use_dpi:
@@ -115,7 +135,8 @@ class WAFT(nn.Module):
         n, _, h, w = fmap1.shape
 
         # ---- 匹配分支（方向3）：从原始图像提匹配友好特征（1/4 分辨率）----
-        if self.use_anchor:
+        m1 = m2 = None
+        if self.use_anchor or (self.use_gwce and self.gwce.use_corr):
             m1 = self.matching_branch(image1)
             m2 = self.matching_branch(image2)
 
@@ -181,6 +202,9 @@ class WAFT(nn.Module):
                     net = net + anchor
 
             net = self.delta_decoder(net)
+            # GWCE 补充式旁路（v3）：三路编码融合残差注入（Fusion 零初始化 → 初始等价原版）
+            if self.use_gwce:
+                net = net + self.gwce(m1, m2, fmap1, warped_fmap2, disp)
             info = self.delta_dist_head(net)
             delta_disp = self.delta_disp_head(net)
             mask = .25 * self.delta_mask_head(net)
