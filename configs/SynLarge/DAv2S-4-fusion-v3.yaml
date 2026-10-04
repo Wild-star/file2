@@ -1,0 +1,74 @@
+# =====================================================================
+# FusionWarp-Stereo 训练配置 v3 —— 补充式 GWCE 旁路（学习 WAVE GWCE + PCW）
+# =====================================================================
+# 对应 docs/paper_design_fusionwarp.md v3 设计：
+#   在 WAFT 原始结构**一字不动**的前提下，新增一个 GWCE 式三路并行编码旁路：
+#     ① correlation（窄带检索，PCW warping volume）
+#     ② warp 对齐（复用 WAFT 原 warped）
+#     ③ disparity prior（7×7 大核）
+#   三路独立编码 → Fusion 融合 → 门控残差注入 net（补充，非替换）。
+#
+# 与 fusion-full.yaml（已证失败）的关键区别：
+#   ✗ 不再 USE_GLOBAL_INIT（替换 prop bins 初始化）
+#   ✗ 不再 vit_sparse（替换 VitIter）
+#   ✗ 不再 USE_GATED_FUSION（替换式门控）
+#   ✓ 保留原始 vit 解码器 + prop bins 初始化 + 原始损失（自回归一致性不动）
+#   ✓ 代价体融合收敛为「一个统一旁路」，门控零初始化 → 可加载预训练 WAFT
+#
+# ⚠️ 代码状态：GWCE_* 配置项为新增接口，需在 model/fusion.py 新增 GWCE 模块 +
+#   waft.py 接入（旁路残差 + 零初始化门控）。当前 waft.py 仅支持旧 fusion 开关。
+# =====================================================================
+ALGORITHM: "waft"
+WAFT:
+  MAX_DISP: 800
+  LOSS: ['mixlap_40']               # WAFT 原始损失（mixlap + 41 bins 分类），不换
+  FEATURE_ENCODER:
+    TYPE: "dav2"
+    ARCH: "vits"
+    LORA_RANK: 8
+    LORA_ALPHA: 16
+  ITERATIVE_MODULE:
+    TASK: ['delta', 'delta', 'delta']
+    DELTA_ITER:
+      TYPE: "vit"                   # 原始 VitIter（不替换成 vit_sparse）
+      ARCH: "vits"
+      PATCH_SIZE: 8
+    PROP_ITER:
+      TYPE: "vit"                   # 原始 prop 初始化（不替换成 GlobalMatcher）
+      ARCH: "vits"
+      PATCH_SIZE: 8
+  FUSION:
+    ENABLED: True
+
+    # === 补充式 GWCE 旁路（学习 WAVE GWCE + PCW warping volume）===
+    GWCE_ENABLED: True              # 总开关：三路并行编码旁路
+    GWCE_CORR: True                 # ① correlation 分支（窄带检索，多候选证据）
+    GWCE_WARP: True                 # ② warp 对齐分支（复用 warped，残差对齐）
+    GWCE_DISP_PRIOR: True           # ③ disparity prior 分支（7×7 大核，几何状态）
+
+    # 三路分支参数
+    MATCH_CH: 32                    # 匹配特征通道（correlation 分支输入）
+    CORR_RADIUS: 4                  # 窄带检索半径 R（PCW warping volume 缩小搜索范围）
+    CORR_GROUPS: 8                  # group-wise 相关组数 G
+    DISP_PRIOR_KERNEL: 7            # disparity prior 7×7 大核
+    FUSION_CH: 32                   # Fusion 输出通道（= hidden_dim）
+
+    # 注入方式（补充，非替换）
+    GATE_ZERO_INIT: True            # 门控零初始化 → 加载预训练 WAFT 后行为等价原版
+DATASETS:
+  TRAIN: ("sceneflow",)
+  MUL: (1,)
+  CROP_SIZE: [480, 640]
+  TEST: ("things",)
+TEST:
+  EVAL_PERIOD: 10000
+  EVAL_THRESH: (['1.0', '3.0'],)
+  EVAL_MAX_DISP: [null,]
+  EVAL_ONLY_VALID: (True,)
+SOLVER:
+  MIX_PRECISION: True
+  NO_RESUME_OPTIMIZER: True
+  IMS_PER_BATCH: 16
+  MAX_ITER: 400000
+  CHECKPOINT_PERIOD: 10000
+  BASE_LR: 0.00025                  # batch16 → LR 降半
